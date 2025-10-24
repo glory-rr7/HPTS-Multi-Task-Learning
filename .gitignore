@@ -1,5 +1,95 @@
-.cadence/
-.idea
+# ===========================================
+# HTR Project - Simplified .gitignore
+# ===========================================
+
+# ===========================================
+# Python Core
+# ===========================================
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ===========================================
+# Deep Learning & ML
+# ===========================================
+# Model files
+*.pth
+*.pt
+*.pkl
+*.h5
+*.ckpt
+*.bin
+*.weights
+
+# Training outputs
+logs/
+*.log
+tensorboard_logs/
+wandb/
+outputs/
+results/
+runs/
+
+# Data directories (large datasets)
 data/
 datasets/
-__pycache__/
+cache/
+temp/
+
+# ===========================================
+# IDE & OS
+# ===========================================
+# IDEs
+.idea/
+.vscode/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ===========================================
+# Project Specific
+# ===========================================
+# Images and media (training data)
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+*.gif
+
+# Archives
+*.rar
+*.zip
+*.7z
+*.tar.gz
+
+# Config backups
+config_bak.yaml
+*.bak
+
+# ===========================================
+# Security
+# ===========================================
+.env
+*.key
+*.pem
+secrets.json
+
+# ===========================================
+# Keep Important Files
+# ===========================================
+!config/config.yaml
+!environment.yml
+!README.md
+!*.py
+!requirements.txt
