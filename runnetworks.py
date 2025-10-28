@@ -15,14 +15,16 @@ import sys
 import time
 from torchvision.utils import save_image
 import torch
-import torch.nn.utils as nn_utils
+# from loss.Loos_light import SegMultTaskLoss,SimilarityLoss, RefinementLoss
 from loss.Loss import SegMultTaskLoss,SimilarityLoss, RefinementLoss
-from models import Release,Release_lightly, Release_lightly_extra, Custom, Release_quantized
+from models import Release,Release_lightly, Release_lightly_extra, Custom
 from utils import sample_images, save_tensor_as_image, split_image, ImageBlocks ,get_transformer,maskToTensor, augment_batch_independent
 from dataloader.seg_datasets import SegImageDataset
 from dataloader.block_seg_datasets import BlockSegImageDataset
 from config.config_utils import LoadConfig
-from torch.quantization import prepare_qat, get_default_qat_qconfig
+
+
+
 # Work space
 class RunNetworks():
     def __init__(self, config):
@@ -91,26 +93,6 @@ class RunNetworks():
             model_path = self.config['train']['pretrained']['model_path']
             self.model.load_state_dict(torch.load(model_path), strict=False)
 
-        # 移除可能存在的 spectral_norm，避免 QAT 转换时报权重类型错误
-        def _remove_sn(m):
-            try:
-                nn_utils.remove_spectral_norm(m)
-            except Exception:
-                pass
-        self.model.apply(_remove_sn)
-        # 量化感知训练相关设置 == start ==
-        torch.backends.quantized.engine = 'fbgemm'
-        try:
-            self.model.fuse_model()
-        except Exception as e:
-            print(f"[QAT] fuse_model warning: {e}")
-        
-        self.model.cpu()
-        self.model.qconfig = get_default_qat_qconfig(torch.backends.quantized.engine)
-        prepare_qat(self.model, inplace=True)
-        self.model.to(self.device)
-        self.model.train()
-        # == end ==
         # Loss
         # 创建损失函数
         criterion = SegMultTaskLoss().to(self.device)
@@ -368,7 +350,7 @@ class RunNetworks():
 
         # Use pretrained model
         model_path = self.config['evaluate']['model_path']
-        self.model.load_state_dict(torch.load(model_path))
+        self.model.load_state_dict(torch.load(model_path), strict=False)
 
         # Loss
         # 创建损失函数
@@ -534,7 +516,6 @@ class RunNetworks():
                     x2.add_block([element // 2 for element in pos], x2_b)
                     x3.add_block(pos, x3_b)
                     output.add_block(pos, output_b)
-
                     mask_b = torch.argmax(mask_b,1).unsqueeze(0)
                     mask_b = maskToTensor(mask_b, self.device)
                     mask.add_block(pos, mask_b)
@@ -563,6 +544,7 @@ class RunNetworks():
 
             save_image(mask, os.path.join(str(self.data_root_path),'mask.png'), nrow=1, normalize=True)
 
+
     def _get_model(self):
         self.model_name = self.config['run']['model']
         model = self.model_name
@@ -572,8 +554,6 @@ class RunNetworks():
             self.model = Release_lightly.ResNet_UNet().to(self.device)
         elif model =='Release_lightly_extra':
             self.model = Release_lightly_extra.ResNet_UNet().to(self.device)
-        elif model == "Release_quantized":
-            self.model = Release_quantized.ResNet_UNet().to(self.device)
         elif model == 'Custom':
             self.model = Custom.ResNet_UNet(base=self.config['custom']['base'],
                                             refinement=self.config['custom']['refinement'],
@@ -583,6 +563,8 @@ class RunNetworks():
                                             am=self.config['custom']['am']).to(self.device)
         else:
             print("Error: Model is not exist!")
+
+
 
     def _init_data_path(self,save_path,logs_file):
         work_type_path = os.path.join(self.config['run']['data_path'],self.worktype)
@@ -620,43 +602,3 @@ if __name__ == '__main__':
     config = LoadConfig()
     network = RunNetworks(config)
     network.work()
-    #
-    # import torch
-    # from torch.quantization import prepare_qat, get_default_qat_qconfig
-    #
-    # try:
-    #     # 1) 选择量化后端（x86 用 fbgemm）
-    #     torch.backends.quantized.engine = 'fbgemm'
-    #
-    #     # 2) 构建模型
-    #     model = Release_quantized.ResNet_UNet(n_channels=3, n_classes=3)
-    #
-    #     # 3) 融合
-    #     try:
-    #         model.fuse_model()
-    #         print("[QAT TEST] fuse_model ok")
-    #     except Exception as e:
-    #         print(f"[QAT TEST] fuse_model warning: {e}")
-    #
-    #     # 4) QAT 准备（在 CPU 上 prepare，再迁移设备）
-    #     model.cpu()
-    #     model.qconfig = get_default_qat_qconfig(torch.backends.quantized.engine)
-    #     prepare_qat(model, inplace=True)
-    #     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    #     model.to(device)
-    #     model.train()
-    #
-    #     # 5) 构造一次随机前向，检查输出形状
-    #     x = torch.randn(2, 3, 512, 512, device=device)
-    #     with torch.no_grad():
-    #         xo1, xo2, x_o_unet, x_refine, mm = model(x)
-    #
-    #     print("[QAT TEST] forward ok")
-    #     print("  xo1:", tuple(xo1.shape))
-    #     print("  xo2:", tuple(xo2.shape))
-    #     print("  x_o_unet:", tuple(x_o_unet.shape))
-    #     print("  refine:", tuple(x_refine.shape))
-    #     print("  mask:", tuple(mm.shape))
-    # except Exception as e:
-    #     print(f"[QAT TEST] failed: {e}")
-    # # ====== QAT 改造自检结束 ======
