@@ -1,152 +1,100 @@
 import glob
 import os
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
 import random
+
 import torch
-import torch.nn.functional as F
-from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
+import torchvision.transforms as transforms
+import torchvision.io as tvio
+from torch.utils.data import Dataset, DataLoader
 
-# 定义检测函数
-def test_maskToTensor(mask_tensor):
-    color_to_label = {
-        (255, 255, 255): 0,  # white -> 0
-        (0, 255, 0): 1,  # green -> 1
-        (255, 0, 0): 2,  # red -> 2
-        (0, 0, 255): 3  # blue -> 3
-    }
-
-    label_to_color = {v: k for k, v in color_to_label.items()}  # 反向映射
-
-    """
-    这个函数将检测 maskToTensor 是否正确。
-    输入一个单通道的三维张量，生成一个三通道的图像并展示。
-    """
-
-
-    # Step 2: 将 tensor 转换回颜色图像
-    mask_array = mask_tensor.squeeze(0).numpy()  # 去掉通道维度，变为 (H, W)
-
-    # Step 3: 根据标签生成对应的颜色图像
-    height, width = mask_array.shape
-    color_image = np.zeros((height, width, 3), dtype=np.uint8)
-
-    # 为每个标签像素填充对应的颜色
-    for label, color in label_to_color.items():
-        color_image[mask_array == label] = color
-
-    # Step 4: 使用 PIL.Image 展示图像
-    img = Image.fromarray(color_image)
-    img.show()
-
-def maskToTensor(mask):
-    mask_array = np.array(mask)
-
-    # Create an empty single-channel tensor (initialized to zeros)
-    mask_tensor = np.zeros((mask_array.shape[0], mask_array.shape[1]), dtype=np.int64)  # 单通道 tensor
-
-    # Color-to-label mapping
-    color_to_label = {
-        (255, 255, 255): 0,  # white -> 0
-        (0, 255, 0): 1,  # green -> 1
-        (255, 0, 0): 2,  # red -> 2
-        (0, 0, 255): 3  # blue -> 3
-    }
-
-    # Iterate through the color-to-label mapping and set values
-    for color, label in color_to_label.items():
-        mask_tensor[(mask_array[:, :, 0] == color[0]) &
-                    (mask_array[:, :, 1] == color[1]) &
-                    (mask_array[:, :, 2] == color[2])] = label  # Assign label to the corresponding pixel
-
-    # Convert the numpy array to a tensor
-    return torch.tensor(mask_tensor, dtype=torch.long)  # Convert to long type tensor (suitable for classification)
 
 class SegImageDataset(Dataset):
     def __init__(self, root, mode="train"):
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
 
-        # 获取 'images'、'rebuild' 和 'mask' 文件夹路径
         image_dir = os.path.join(root, 'images')
         rebuild_dir = os.path.join(root, 'rebuild')
-        mask_dir = os.path.join(root, 'mask')
-        print(image_dir, rebuild_dir, mask_dir)
-        # 获取 images 文件夹中所有 png 文件的文件名（去除扩展名）
-        image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
-        self.image_names = [os.path.splitext(os.path.basename(f))[0] for f in image_files]
+        label_dir = os.path.join(root, 'labels')
+        print(image_dir, rebuild_dir, label_dir)
 
-        # 创建一个字典，存储 rebuild 和 mask 文件的路径，以文件名（去除扩展名）为键
-        self.image_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in
-                             glob.glob(os.path.join(image_dir, "*.png"))}
+        image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
+        image_names = [os.path.splitext(os.path.basename(f))[0] for f in image_files]
+
+        self.image_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in image_files}
         self.rebuild_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in
                              glob.glob(os.path.join(rebuild_dir, "*.png"))}
-        self.mask_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in
-                          glob.glob(os.path.join(mask_dir, "*.png"))}
+        self.label_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in
+                           glob.glob(os.path.join(label_dir, "*.png"))}
 
-        # 过滤出在三个文件夹中都有对应文件的文件名
-        self.valid_image_names = [name for name in self.image_names if
-                                  name in self.rebuild_dict and name in self.mask_dict]
+        self.valid_image_names = [name for name in image_names if
+                                  name in self.rebuild_dict and name in self.label_dict]
 
-        print(f"{mode} image files: {len(self.valid_image_names)}")  # 打印有效文件数量
+        print(f"{mode} image files: {len(self.valid_image_names)}")
 
     def __getitem__(self, index):
-        # 获取当前索引对应的文件名
         file_name = self.valid_image_names[index]
 
-        # 加载 images, rebuild 和 mask 文件
-        img_A = Image.open(self.image_dict[file_name])
-        img_B = Image.open(self.rebuild_dict[file_name])
-        img_C = Image.open(self.mask_dict[file_name])
+        # read_image 直接返回 (C, H, W) uint8 tensor，比 PIL 快
+        img = tvio.read_image(self.image_dict[file_name])      # (3, H, W)
+        reb = tvio.read_image(self.rebuild_dict[file_name])     # (3, H, W)
+        label = tvio.read_image(self.label_dict[file_name])     # (1, H, W) 灰度，值 0~3
 
-        if np.random.random() < 0.5:
-            img_A, img_B, img_C = random_filp(img_A, img_B, img_C)
+        # 处理可能的 4 通道（RGBA）
+        if img.shape[0] == 4:
+            img = img[:3]
+        if reb.shape[0] == 4:
+            reb = reb[:3]
+        # label 只取第一通道
+        if label.shape[0] > 1:
+            label = label[0:1]
 
-        # 应用预定义的转换（比如标准化、归一化等）
-        img_A = self.transform(img_A)
-        img_B = self.transform(img_B)
-        mask = maskToTensor(img_C).unsqueeze(0)
-        #test_maskToTensor(mask)
-        return img_A,img_B,mask
-        #return {"A": img_A, "B": img_B, "mask": mask}
+        if random.random() < 0.5:
+            img, reb, label = random_flip(img, reb, label)
 
+        # uint8 -> float32 [0,1] -> normalize
+        img = self.normalize(img.float() / 255.0)
+        reb = self.normalize(reb.float() / 255.0)
+        label = label.long()  # (1, H, W)，值 ∈ {0,1,2,3}
+
+        return img, reb, label
 
     def __len__(self):
-        # 返回有效文件的数量
         return len(self.valid_image_names)
 
-def random_filp(image, rebuild, mask):
-    type = np.random.random()
-    if type < 0.2:
-        image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        rebuild = rebuild.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        mask = mask.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-    elif type < 0.4:
-        image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-        rebuild = rebuild.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-        mask = mask.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-    elif type < 0.6:
-        image = image.transpose(Image.Transpose.ROTATE_90)
-        rebuild = rebuild.transpose(Image.Transpose.ROTATE_90)
-        mask = mask.transpose(Image.Transpose.ROTATE_90)
-    elif type < 0.8:
-        image = image.transpose(Image.Transpose.ROTATE_180)
-        rebuild = rebuild.transpose(Image.Transpose.ROTATE_180)
-        mask = mask.transpose(Image.Transpose.ROTATE_180)
-    elif type < 1:
-        image = image.transpose(Image.Transpose.ROTATE_270)
-        rebuild = rebuild.transpose(Image.Transpose.ROTATE_270)
-        mask = mask.transpose(Image.Transpose.ROTATE_270)
-    return image, rebuild, mask
+
+def random_flip(img, reb, label):
+    """对 (C, H, W) tensor 做同步随机翻转/旋转"""
+    r = random.random()
+    if r < 0.2:
+        img = torch.flip(img, dims=[2])
+        reb = torch.flip(reb, dims=[2])
+        label = torch.flip(label, dims=[2])
+    elif r < 0.4:
+        img = torch.flip(img, dims=[1])
+        reb = torch.flip(reb, dims=[1])
+        label = torch.flip(label, dims=[1])
+    elif r < 0.6:
+        img = torch.rot90(img, k=1, dims=[1, 2])
+        reb = torch.rot90(reb, k=1, dims=[1, 2])
+        label = torch.rot90(label, k=1, dims=[1, 2])
+    elif r < 0.8:
+        img = torch.rot90(img, k=2, dims=[1, 2])
+        reb = torch.rot90(reb, k=2, dims=[1, 2])
+        label = torch.rot90(label, k=2, dims=[1, 2])
+    else:
+        img = torch.rot90(img, k=3, dims=[1, 2])
+        reb = torch.rot90(reb, k=3, dims=[1, 2])
+        label = torch.rot90(label, k=3, dims=[1, 2])
+    return img, reb, label
+
 
 if __name__ == "__main__":
     dataset = DataLoader(
         SegImageDataset("../dataset/demo"),
         batch_size=1,
     )
-    for idx, (imgs, gt, masks) in enumerate(dataset):
-        print(imgs.shape, gt.shape, masks.shape)
+    for idx, (imgs, gt, labels) in enumerate(dataset):
+        print(imgs.shape, gt.shape, labels.shape)
