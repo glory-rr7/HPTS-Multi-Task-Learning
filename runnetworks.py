@@ -123,12 +123,16 @@ class RunNetworks():
                 SegImageDataset(root=self.config['train']['dataset_path'], mode="train"),
                 batch_size=self.config['train']['batch_size'],
                 drop_last=True,
-                shuffle=True)
+                shuffle=True,
+                num_workers=self.config['train']['numberworks'],
+                pin_memory=True)
             valdataset=SegImageDataset(root=self.config['validation']['dataset_path'], mode="validation")
             valdataloader = DataLoader(
                 valdataset,
                 batch_size=self.config['validation']['batch_size'],
-                shuffle=True)
+                shuffle=True,
+                num_workers=self.config['validation']['numberworks'],
+                pin_memory=True)
 
         # Optimizer
         # 创建优化器
@@ -362,14 +366,18 @@ class RunNetworks():
         if self.config['run']['data_crop']['use'] :
             evaldataset = DataLoader(
                 BlockSegImageDataset(root=self.config['evaluate']['dataset_path'], mode="evaluate",tile_size=self.config['run']['data_crop'] ['size']),
-                batch_size=1,  # self.config['train']['batchSize'],
-                shuffle=True)
+                batch_size=1,
+                shuffle=True,
+                num_workers=self.config['evaluate']['numberworks'],
+                pin_memory=True)
 
         else:
             evaldataset = DataLoader(
                 SegImageDataset(root=self.config['evaluate']['dataset_path'], mode="evaluate"),
-                batch_size=1,  # self.config['train']['batchSize'],
-                shuffle=True)
+                batch_size=1,
+                shuffle=True,
+                num_workers=self.config['evaluate']['numberworks'],
+                pin_memory=True)
 
 
 
