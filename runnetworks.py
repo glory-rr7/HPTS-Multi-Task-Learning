@@ -189,6 +189,17 @@ class RunNetworks():
                     G_loss = criterion(masks,fake_images,gt)
                 else:
                     G_loss = criterion(masks, x_o1, x_o2, x_o3, fake_images, mm, gt, idx)
+
+                target = masks.squeeze(1)
+                u = torch.unique(target)
+
+                #print("mm.shape:", mm.shape, "target dtype:", target.dtype, "target unique:", u[:20])
+
+                if target.min() < 0 or target.max() >= mm.shape[1]:
+                    raise RuntimeError(
+                        f"target out of range: min={target.min().item()}, max={target.max().item()}, "
+                        f"num_classes={mm.shape[1]}, unique={u.tolist()[:50]}"
+                    )
                 G_loss = G_loss.sum()
                 G_optimizer.zero_grad()
                 G_loss.backward()
