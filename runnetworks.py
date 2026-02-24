@@ -15,10 +15,18 @@ import sys
 import time
 from torchvision.utils import save_image
 import torch
+import torch.nn as nn
 # from loss.Loos_light import SegMultTaskLoss,SimilarityLoss, RefinementLoss
-from loss.Loss import SegMultTaskLoss,SimilarityLoss, RefinementLoss
+from loss.Loss import (
+    SegMultTaskLoss,
+    SimilarityLoss,
+    RefinementLoss,
+    DistillationLoss,
+    deep_feature_l2_loss,
+    deep_feature_at_loss,
+)
 from models import Release,Release_lightly, Release_lightly_extra, Custom
-from utils import sample_images, save_tensor_as_image, split_image, ImageBlocks ,get_transformer,maskToTensor, augment_batch_independent
+from utils import sample_images, save_tensor_as_image, split_image, ImageBlocks ,get_transformer,maskToTensor
 from dataloader.seg_datasets import SegImageDataset
 from dataloader.block_seg_datasets import BlockSegImageDataset
 from config.config_utils import LoadConfig
@@ -37,23 +45,54 @@ class RunNetworks():
         # 设置运算设备
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        # Work Type: train, evaluate or predict
-        # 设置运行模式，分别有训练、评估、预测三种模式
+        # Work Type: train, train_distill, evaluate or predict
+        # 设置运行模式
         self.worktype = config['run']['type']
+
+        self.teacher_model = None
+        self.student_model = None
+        self.teacher_adapter = None
+        self.teacher_hook_handle = None
+        self.student_hook_handle = None
+        self.teacher_deep_feature = None
+        self.student_deep_feature = None
+        self.deep_method = None
+        self.teacher_adapter_trainable = False
+        self.adapter_resume_path = None
 
         # Model
         # 选择模型
-        self._get_model()
-
-        # Run ID
-        # 运行ID
-        self.run_id = self.model.get_name()+ '_' + dt2.now().strftime("%Y%m%d_%H%M%S")
+        if self.worktype == 'train_distill':
+            self._get_distill_models()
+            self.model = self.student_model
+            self.run_id = (
+                f"Distill_{self.teacher_model_name}_to_{self.student_model_name}_"
+                f"{dt2.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+        else:
+            self._get_model()
+            # Run ID
+            # 运行ID
+            self.run_id = self.model.get_name()+ '_' + dt2.now().strftime("%Y%m%d_%H%M%S")
 
         # The root path of this running
         # 该次运行的根路径，用于存储相关文件
         self.data_root_path = os.path.join(self.config['run']['data_path'],self.worktype, self.run_id)
 
         self.train_logs_fields = ['epoch', 'loss','L1','MSE','PSNR','ValidationMSE','ValidationPSNR']
+        self.distill_logs_fields = [
+            'epoch',
+            'loss_total',
+            'loss_task',
+            'loss_deep',
+            'loss_output',
+            'loss_mm',
+            'L1',
+            'MSE',
+            'PSNR',
+            'ValidationMSE',
+            'ValidationPSNR',
+        ]
 
         self.evaluate_logs_fields = ['idx', 'loss', 'L1','MSE','PSNR','SSIM','total_loss', 'total_L1','total_MSE','total_PSNR','total_SSIM','file_num']
 
@@ -62,10 +101,14 @@ class RunNetworks():
         # 调用函数
         print("----------------------Start to work!----------------------")
         print("Run type:", self.worktype,"  Model:",self.model.get_name())
+        if self.worktype == 'train_distill':
+            print("Teacher:", self.teacher_model_name, " Student:", self.student_model_name)
         pid = os.getpid()
         print(f'Run ID: {self.run_id}, Process ID: {pid}')
         if self.worktype == 'train':
             self.train()
+        elif self.worktype == 'train_distill':
+            self.train_distill()
         elif self.worktype == 'evaluate':
             self.evaluate()
         elif self.worktype == 'predict':
@@ -105,13 +148,23 @@ class RunNetworks():
         if self.config['run']['data_crop']['use'] :
 
             traindataset = DataLoader(
-                BlockSegImageDataset(root=self.config['train']['dataset_path'], mode="train",tile_size=self.config['run']['data_crop'] ['size']),
+                BlockSegImageDataset(
+                    root=self.config['train']['dataset_path'],
+                    mode="train",
+                    tile_size=self.config['run']['data_crop'] ['size'],
+                    use_aug=self.config['train']['aug'],
+                ),
                 batch_size=self.config['train']['batch_size'],
                 shuffle=True,
                 drop_last=True,
                 num_workers=self.config['train']['numberworks'])
 
-            valdataset=BlockSegImageDataset(root=self.config['validation']['dataset_path'], mode="validation",tile_size=self.config['run']['data_crop'] ['size'])
+            valdataset=BlockSegImageDataset(
+                root=self.config['validation']['dataset_path'],
+                mode="validation",
+                tile_size=self.config['run']['data_crop'] ['size'],
+                use_aug=False,
+            )
             valdataloader = DataLoader(
                 valdataset,
                 batch_size=self.config['validation']['numberworks'],
@@ -120,13 +173,21 @@ class RunNetworks():
 
         else:
             traindataset = DataLoader(
-                SegImageDataset(root=self.config['train']['dataset_path'], mode="train"),
+                SegImageDataset(
+                    root=self.config['train']['dataset_path'],
+                    mode="train",
+                    use_aug=self.config['train']['aug'],
+                ),
                 batch_size=self.config['train']['batch_size'],
                 drop_last=True,
                 shuffle=True,
                 num_workers=self.config['train']['numberworks'],
                 pin_memory=True)
-            valdataset=SegImageDataset(root=self.config['validation']['dataset_path'], mode="validation")
+            valdataset=SegImageDataset(
+                root=self.config['validation']['dataset_path'],
+                mode="validation",
+                use_aug=False,
+            )
             valdataloader = DataLoader(
                 valdataset,
                 batch_size=self.config['validation']['batch_size'],
@@ -172,9 +233,6 @@ class RunNetworks():
                 gt = gt.to(self.device)
                 masks = masks.to(self.device)
 
-                # 图像增强技术，但是使用的时候，显存会发生变化，可能忽大忽小，确保显存够再使用
-                if self.config['train']['aug']:
-                    imgs, gt, masks = augment_batch_independent(imgs, gt, masks)
                 self.model.zero_grad()
 
                 # Get output from forward and calculate loss to train model
@@ -284,6 +342,232 @@ class RunNetworks():
 
             print()
 
+    def train_distill(self):
+        train_cfg = self.config['train']
+        distill_cfg = self.config['distill']
+        loss_weights = distill_cfg['loss_weights']
+        print("Distill Epoch:", train_cfg['epochs'], "  Batch size:", train_cfg['batch_size'])
+
+        save_models_dir = os.path.join(str(self.data_root_path), str('models'))
+        save_samples_dir = os.path.join(str(self.data_root_path), str('samples'))
+        save_logs_path = os.path.join(str(self.data_root_path), str('logs.csv'))
+        self._init_data_path([save_models_dir, save_samples_dir], save_logs_path)
+
+        criterion_task = SegMultTaskLoss().to(self.device)
+        criterion_distill = DistillationLoss().to(self.device)
+
+        if self.config['run']['data_crop']['use']:
+            traindataset = DataLoader(
+                BlockSegImageDataset(
+                    root=train_cfg['dataset_path'],
+                    mode="train",
+                    tile_size=self.config['run']['data_crop']['size'],
+                    use_aug=train_cfg['aug'],
+                ),
+                batch_size=train_cfg['batch_size'],
+                shuffle=True,
+                drop_last=True,
+                num_workers=train_cfg['numberworks']
+            )
+            valdataset = BlockSegImageDataset(
+                root=self.config['validation']['dataset_path'],
+                mode="validation",
+                tile_size=self.config['run']['data_crop']['size'],
+                use_aug=False,
+            )
+            valdataloader = DataLoader(
+                valdataset,
+                batch_size=self.config['validation']['batch_size'],
+                shuffle=True,
+                num_workers=self.config['validation']['numberworks']
+            )
+        else:
+            traindataset = DataLoader(
+                SegImageDataset(
+                    root=train_cfg['dataset_path'],
+                    mode="train",
+                    use_aug=train_cfg['aug'],
+                ),
+                batch_size=train_cfg['batch_size'],
+                drop_last=True,
+                shuffle=True,
+                num_workers=train_cfg['numberworks'],
+                pin_memory=True
+            )
+            valdataset = SegImageDataset(
+                root=self.config['validation']['dataset_path'],
+                mode="validation",
+                use_aug=False,
+            )
+            valdataloader = DataLoader(
+                valdataset,
+                batch_size=self.config['validation']['batch_size'],
+                shuffle=True,
+                num_workers=self.config['validation']['numberworks'],
+                pin_memory=True
+            )
+
+        optimizer_params = list(self.student_model.parameters())
+        if self.teacher_adapter is not None and self.teacher_adapter_trainable:
+            optimizer_params += list(self.teacher_adapter.parameters())
+
+        optimizer = optim.Adam(
+            optimizer_params,
+            lr=train_cfg['learning_rate'],
+            betas=(0.9, 0.999)
+        )
+
+        recent_times = collections.deque(maxlen=len(traindataset) + 1)
+        start_time = time.time()
+        pre_time = time.time()
+
+        sample_images(valdataset, self.student_model, os.path.join(save_samples_dir, str(0) + '.png'))
+        torch.save(self.student_model.state_dict(), os.path.join(save_models_dir, str(0) + '.pth'))
+        if self.deep_method == 'l2' and self.teacher_adapter is not None:
+            torch.save(self.teacher_adapter.state_dict(), os.path.join(save_models_dir, str(0) + '_adapter.pth'))
+
+        for epochs in range(1, train_cfg['epochs'] + 1):
+            torch.cuda.empty_cache()
+            epoch_loss_total = 0.0
+            epoch_loss_task = 0.0
+            epoch_loss_deep = 0.0
+            epoch_loss_output = 0.0
+            epoch_loss_mm = 0.0
+            epoch_L1_loss = 0.0
+            epoch_mse_loss = 0.0
+            epoch_psnr = 0.0
+
+            self.teacher_model.eval()
+            self.student_model.train()
+            if self.teacher_adapter is not None and self.teacher_adapter_trainable:
+                self.teacher_adapter.train()
+
+            for idx, (imgs, gt, masks) in enumerate(traindataset):
+                imgs = imgs.to(self.device)
+                gt = gt.to(self.device)
+                masks = masks.to(self.device)
+
+                self.teacher_deep_feature = None
+                self.student_deep_feature = None
+
+                with torch.no_grad():
+                    if self.teacher_model.return_num() == 4:
+                        _, _, teacher_output, teacher_mm = self.teacher_model(imgs)
+                    else:
+                        _, _, _, teacher_output, teacher_mm = self.teacher_model(imgs)
+
+                if self.student_model.return_num() == 4:
+                    s_xo1, s_xo2, s_xo3, student_mm = self.student_model(imgs)
+                    student_output = s_xo3
+                else:
+                    s_xo1, s_xo2, s_xo3, student_output, student_mm = self.student_model(imgs)
+
+                if self.teacher_deep_feature is None or self.student_deep_feature is None:
+                    raise RuntimeError("Error: Deep feature hook failed to capture outputs.")
+
+                task_loss = criterion_task(masks, s_xo1, s_xo2, s_xo3, student_output, student_mm, gt, idx)
+                task_loss = task_loss.sum()
+                output_loss, mm_loss = criterion_distill(
+                    student_output=student_output,
+                    student_mm=student_mm,
+                    teacher_output=teacher_output,
+                    teacher_mm=teacher_mm
+                )
+                deep_loss = self._compute_deep_loss(
+                    student_deep=self.student_deep_feature,
+                    teacher_deep=self.teacher_deep_feature,
+                    optimizer=optimizer
+                )
+
+                total_loss = (
+                    loss_weights['task'] * task_loss +
+                    loss_weights['deep'] * deep_loss +
+                    loss_weights['output'] * output_loss +
+                    loss_weights['mm'] * mm_loss
+                )
+
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+
+                epoch_loss_total += total_loss.item()
+                epoch_loss_task += task_loss.item()
+                epoch_loss_deep += deep_loss.item()
+                epoch_loss_output += output_loss.item()
+                epoch_loss_mm += mm_loss.item()
+
+                with torch.no_grad():
+                    L1_loss, mse_loss, psnr = SimilarityLoss(student_output, gt, SSIM=False)
+                    epoch_L1_loss += L1_loss.item()
+                    epoch_mse_loss += mse_loss.item()
+                    epoch_psnr += psnr.item()
+
+                    batch_time = time.time() - pre_time
+                    recent_times.append(batch_time)
+                    avg_batch_time = sum(recent_times) / len(recent_times)
+                    elapsed_time = time.time() - start_time
+                    formatted_elapsed = dt.timedelta(seconds=int(elapsed_time))
+
+                    batches_done = (epochs - 1) * (len(traindataset) + 1) + idx + 1
+                    total_batches = train_cfg['epochs'] * (len(traindataset) + 1)
+                    remaining_batches = total_batches - batches_done
+                    eta_seconds = remaining_batches * avg_batch_time
+                    formatted_eta = dt.timedelta(seconds=int(eta_seconds))
+
+                sys.stdout.write(
+                    f"\rEpoch: [{epochs}/{train_cfg['epochs']}] "
+                    f"Batch: [{idx + 1}/{len(traindataset)}] "
+                    f"LossTotal: {epoch_loss_total / (idx + 1):.4f} "
+                    f"Task: {epoch_loss_task / (idx + 1):.4f} "
+                    f"Deep: {epoch_loss_deep / (idx + 1):.4f} "
+                    f"Output: {epoch_loss_output / (idx + 1):.4f} "
+                    f"MM: {epoch_loss_mm / (idx + 1):.4f} "
+                    f"L1: {epoch_L1_loss / (idx + 1):.4f} "
+                    f"MSE: {epoch_mse_loss / (idx + 1):.4f} "
+                    f"PSNR: {epoch_psnr / (idx + 1):.4f} "
+                    f"Avg time/batch: {avg_batch_time:.3f}s "
+                    f"Elapsed: {formatted_elapsed} "
+                    f"ETA: {formatted_eta}  "
+                )
+                sys.stdout.flush()
+                pre_time = time.time()
+
+            self.model = self.student_model
+            val_start = time.time()
+            val_mse, val_psnr = self.test_epoch(valdataloader)
+            val_cost = time.time() - val_start
+            recent_times.append(val_cost)
+            pre_time = time.time()
+
+            with open(save_logs_path, mode='a', newline='') as file:
+                writer = csv.DictWriter(file, self.distill_logs_fields)
+                writer.writerow({
+                    'epoch': epochs,
+                    'loss_total': epoch_loss_total / len(traindataset),
+                    'loss_task': epoch_loss_task / len(traindataset),
+                    'loss_deep': epoch_loss_deep / len(traindataset),
+                    'loss_output': epoch_loss_output / len(traindataset),
+                    'loss_mm': epoch_loss_mm / len(traindataset),
+                    'L1': epoch_L1_loss / len(traindataset),
+                    'MSE': epoch_mse_loss / len(traindataset),
+                    'PSNR': epoch_psnr / len(traindataset),
+                    'ValidationMSE': val_mse,
+                    'ValidationPSNR': val_psnr,
+                })
+
+            if (epochs % train_cfg['sample_save_every'] == 0):
+                sample_images(valdataset, self.student_model, os.path.join(save_samples_dir, str(epochs) + '.png'))
+
+            if (epochs % train_cfg['model_save_every'] == 0):
+                torch.save(self.student_model.state_dict(), os.path.join(save_models_dir, str(epochs) + '.pth'))
+                if self.deep_method == 'l2' and self.teacher_adapter is not None:
+                    torch.save(
+                        self.teacher_adapter.state_dict(),
+                        os.path.join(save_models_dir, str(epochs) + '_adapter.pth')
+                    )
+
+            print()
+
     @torch.no_grad()
     def test_epoch(self, testloader):
         """
@@ -376,7 +660,12 @@ class RunNetworks():
         # 创建训练数据集，使用裁剪数据或否不使用裁剪数据
         if self.config['run']['data_crop']['use'] :
             evaldataset = DataLoader(
-                BlockSegImageDataset(root=self.config['evaluate']['dataset_path'], mode="evaluate",tile_size=self.config['run']['data_crop'] ['size']),
+                BlockSegImageDataset(
+                    root=self.config['evaluate']['dataset_path'],
+                    mode="evaluate",
+                    tile_size=self.config['run']['data_crop'] ['size'],
+                    use_aug=False,
+                ),
                 batch_size=1,
                 shuffle=True,
                 num_workers=self.config['evaluate']['numberworks'],
@@ -384,7 +673,11 @@ class RunNetworks():
 
         else:
             evaldataset = DataLoader(
-                SegImageDataset(root=self.config['evaluate']['dataset_path'], mode="evaluate"),
+                SegImageDataset(
+                    root=self.config['evaluate']['dataset_path'],
+                    mode="evaluate",
+                    use_aug=False,
+                ),
                 batch_size=1,
                 shuffle=True,
                 num_workers=self.config['evaluate']['numberworks'],
@@ -564,24 +857,148 @@ class RunNetworks():
             save_image(mask, os.path.join(str(self.data_root_path),'mask.png'), nrow=1, normalize=True)
 
 
+    def _build_model(self, model_name, custom_cfg=None):
+        if model_name == 'Release':
+            return Release.ResNet_UNet().to(self.device)
+        if model_name == 'Release_lightly':
+            return Release_lightly.ResNet_UNet().to(self.device)
+        if model_name == 'Release_lightly_extra':
+            return Release_lightly_extra.ResNet_UNet().to(self.device)
+        if model_name == 'Custom':
+            cfg = custom_cfg if custom_cfg is not None else self.config['custom']
+            return Custom.ResNet_UNet(
+                base=cfg['base'],
+                refinement=cfg['refinement'],
+                ffp=cfg['ffp'],
+                ppm=cfg['ppm'],
+                down_sample=cfg['down_sample'],
+                am=cfg['am']
+            ).to(self.device)
+        raise RuntimeError(f"Error: Model `{model_name}` is not exist!")
+
     def _get_model(self):
         self.model_name = self.config['run']['model']
-        model = self.model_name
-        if model == 'Release':
-            self.model = Release.ResNet_UNet().to(self.device)
-        elif model == 'Release_lightly':
-            self.model = Release_lightly.ResNet_UNet().to(self.device)
-        elif model =='Release_lightly_extra':
-            self.model = Release_lightly_extra.ResNet_UNet().to(self.device)
-        elif model == 'Custom':
-            self.model = Custom.ResNet_UNet(base=self.config['custom']['base'],
-                                            refinement=self.config['custom']['refinement'],
-                                            ffp=self.config['custom']['ffp'],
-                                            ppm=self.config['custom']['ppm'],
-                                            down_sample=self.config['custom']['down_sample'],
-                                            am=self.config['custom']['am']).to(self.device)
+        self.model = self._build_model(self.model_name)
+
+    def _resolve_deep_module(self, model, model_name):
+        tap = self.config['distill'].get('deep_feature_tap', 'ppm_post')
+        if tap != 'ppm_post':
+            raise RuntimeError("Error: only `ppm_post` deep_feature_tap is supported.")
+
+        # Decision-fixed behavior for current project.
+        if model_name == 'Release':
+            return model.ppm
+        if model_name in ('Release_lightly', 'Release_lightly_extra', 'Custom'):
+            return model.down4
+
+        # Fallback for unknown model names.
+        if hasattr(model, 'ppm'):
+            return model.ppm
+        if hasattr(model, 'down4'):
+            return model.down4
+        raise RuntimeError(f"Error: cannot resolve deep feature module for model `{model_name}`.")
+
+    def _register_deep_hooks(self):
+        teacher_module = self._resolve_deep_module(self.teacher_model, self.teacher_model_name)
+        student_module = self._resolve_deep_module(self.student_model, self.student_model_name)
+
+        def teacher_hook(_, __, output):
+            self.teacher_deep_feature = output
+
+        def student_hook(_, __, output):
+            self.student_deep_feature = output
+
+        self.teacher_hook_handle = teacher_module.register_forward_hook(teacher_hook)
+        self.student_hook_handle = student_module.register_forward_hook(student_hook)
+
+    def _get_distill_models(self):
+        if 'distill' not in self.config:
+            raise RuntimeError("Error: `distill` config is required for train_distill mode.")
+
+        distill_cfg = self.config['distill']
+        self.teacher_model_name = distill_cfg['teacher_model']
+        self.student_model_name = distill_cfg['student_model']
+        self.deep_method = distill_cfg.get('deep_method', 'l2').lower()
+        if self.deep_method not in ('l2', 'at'):
+            raise RuntimeError("Error: distill.deep_method must be `l2` or `at`.")
+
+        teacher_custom_cfg = None
+        student_custom_cfg = None
+        if self.teacher_model_name == 'Custom':
+            teacher_custom_cfg = distill_cfg.get('teacher_custom', None)
+            if teacher_custom_cfg is None:
+                raise RuntimeError("Error: `distill.teacher_custom` is required when teacher_model is Custom.")
+        if self.student_model_name == 'Custom':
+            student_custom_cfg = distill_cfg.get('student_custom', None)
+            if student_custom_cfg is None:
+                raise RuntimeError("Error: `distill.student_custom` is required when student_model is Custom.")
+
+        self.teacher_model = self._build_model(self.teacher_model_name, custom_cfg=teacher_custom_cfg)
+        self.student_model = self._build_model(self.student_model_name, custom_cfg=student_custom_cfg)
+
+        teacher_model_path = distill_cfg['teacher_model_path']
+        self.teacher_model.load_state_dict(torch.load(teacher_model_path), strict=False)
+        self.teacher_model.eval()
+        for p in self.teacher_model.parameters():
+            p.requires_grad = False
+
+        student_pretrained_cfg = distill_cfg.get('student_pretrained', {'use': False})
+        if student_pretrained_cfg.get('use', False):
+            student_model_path = student_pretrained_cfg['model_path']
+            self.student_model.load_state_dict(torch.load(student_model_path), strict=False)
+            # Try to resume sidecar adapter checkpoint.
+            self.adapter_resume_path = os.path.splitext(student_model_path)[0] + '_adapter.pth'
+            if not os.path.exists(self.adapter_resume_path):
+                self.adapter_resume_path = None
+
+        adapter_cfg = distill_cfg.get('adapter', {}).get('teacher_conv1x1', {})
+        self.teacher_adapter_trainable = adapter_cfg.get('trainable', True)
+
+        self._register_deep_hooks()
+
+    def _ensure_teacher_adapter(self, teacher_deep, student_deep, optimizer):
+        if self.teacher_adapter is not None:
+            return
+
+        in_channels = teacher_deep.shape[1]
+        out_channels = student_deep.shape[1]
+        self.teacher_adapter = nn.Conv2d(in_channels, out_channels, kernel_size=1).to(self.device)
+
+        if self.adapter_resume_path is not None and os.path.exists(self.adapter_resume_path):
+            self.teacher_adapter.load_state_dict(torch.load(self.adapter_resume_path), strict=False)
+            print(f"Loaded adapter checkpoint: {self.adapter_resume_path}")
+
+        if not self.teacher_adapter_trainable:
+            self.teacher_adapter.eval()
+            for p in self.teacher_adapter.parameters():
+                p.requires_grad = False
         else:
-            print("Error: Model is not exist!")
+            optimizer.add_param_group({'params': self.teacher_adapter.parameters()})
+
+    def _compute_deep_loss(self, student_deep, teacher_deep, optimizer):
+        if self.deep_method == 'at':
+            if teacher_deep.shape[2:] != student_deep.shape[2:]:
+                teacher_deep = torch.nn.functional.interpolate(
+                    teacher_deep,
+                    size=student_deep.shape[2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+            return deep_feature_at_loss(student_deep, teacher_deep)
+
+        if self.deep_method == 'l2':
+            self._ensure_teacher_adapter(teacher_deep, student_deep, optimizer)
+            teacher_mapped = self.teacher_adapter(teacher_deep.detach())
+            if teacher_mapped.shape[2:] != student_deep.shape[2:]:
+                teacher_mapped = torch.nn.functional.interpolate(
+                    teacher_mapped,
+                    size=student_deep.shape[2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+            return deep_feature_l2_loss(student_deep, teacher_mapped)
+
+        raise RuntimeError(f"Error: unknown deep_method `{self.deep_method}`.")
 
 
 
@@ -599,6 +1016,10 @@ class RunNetworks():
             if self.worktype == "train":
                 with open(logs_file, mode='w', newline='') as file:
                     writer = csv.DictWriter(file, fieldnames=self.train_logs_fields)
+                    writer.writeheader()
+            if self.worktype == "train_distill":
+                with open(logs_file, mode='w', newline='') as file:
+                    writer = csv.DictWriter(file, fieldnames=self.distill_logs_fields)
                     writer.writeheader()
             if self.worktype == "evaluate":
                 with open(logs_file, mode='w', newline='') as file:

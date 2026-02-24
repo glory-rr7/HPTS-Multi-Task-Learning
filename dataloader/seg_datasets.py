@@ -7,13 +7,17 @@ import torchvision.transforms as transforms
 import torchvision.io as tvio
 from torch.utils.data import Dataset, DataLoader
 
+from dataloader.augmentation import apply_random_augmentation
+
 
 class SegImageDataset(Dataset):
-    def __init__(self, root, mode="train"):
+    def __init__(self, root, mode="train", use_aug=False, aug_prob=0.6):
         self.normalize = transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225]
         )
+        self.use_aug = use_aug
+        self.aug_prob = aug_prob
 
         image_dir = os.path.join(root, 'images')
         rebuild_dir = os.path.join(root, 'rebuild')
@@ -53,6 +57,11 @@ class SegImageDataset(Dataset):
 
         if random.random() < 0.5:
             img, reb, label = random_flip(img, reb, label)
+
+        if self.use_aug:
+            sample = {"image": img, "mask": label, "rebuild": reb}
+            sample = apply_random_augmentation(sample, enabled=True, apply_prob=self.aug_prob)
+            img, label, reb = sample["image"], sample["mask"], sample["rebuild"]
 
         # uint8 -> float32 [0,1] -> normalize
         img = self.normalize(img.float() / 255.0)

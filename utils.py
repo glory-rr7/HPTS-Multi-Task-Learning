@@ -4,7 +4,6 @@ from torchvision import transforms
 from torchvision.utils import save_image
 import numpy as np
 import random
-import torch.nn.functional as F
 
 def maskToTensor(mask,device):
     # Define the color-to-label and label-to-color mappings
@@ -216,85 +215,3 @@ class ImageBlocks:
         # 保存最终拼接结果，并转换成(H, W, C)
         self.image = result
         return self.image
-
-def augment_batch_independent(
-    image, rebuild, mask,
-    flip_prob=0.5,
-    crop_prob=0.5,
-    scale_prob=0.5,
-    crop_range=(0.7, 1.0),
-    scale_range=(0.5, 1.2)
-):
-    #print("ss")
-    """
-    对同一 batch 上的三路张量(image, rebuild, mask)
-    独立地尝试三种随机增强：flip, crop, scale。
-
-    Args:
-        image, rebuild, mask: Tensor of shape [B, C, H, W]
-        flip_prob:         进行随机翻转/旋转的概率
-        crop_prob:         进行随机裁剪的概率
-        scale_prob:        进行随机缩放的概率
-        crop_range:        裁剪时的宽高比例范围 (min, max)
-        scale_range:       缩放时的宽高比例范围 (min, max)
-
-    Returns:
-        aug_image, aug_rebuild, aug_mask:
-            增强后的张量，shape 可能因 crop/scale 而变化。
-    """
-    B, C, H, W = image.shape
-
-    aug_image, aug_rebuild, aug_mask = image, rebuild, mask
-
-    # 1) Flip / Rotate
-    if random.random() < flip_prob:
-        t = random.random()
-        if t < 0.2:
-            # 左右翻
-            aug_image   = aug_image.flip(3)
-            aug_rebuild = aug_rebuild.flip(3)
-            aug_mask    = aug_mask.flip(3)
-        elif t < 0.4:
-            # 上下翻
-            aug_image   = aug_image.flip(2)
-            aug_rebuild = aug_rebuild.flip(2)
-            aug_mask    = aug_mask.flip(2)
-        else:
-            # 90/180/270° 旋转
-            # t in [0.4,1) 映射到 k=1,2,3
-            k = 1 + int((t - 0.4) / 0.2)
-            aug_image   = torch.rot90(aug_image,   k, dims=(2,3))
-            aug_rebuild = torch.rot90(aug_rebuild, k, dims=(2,3))
-            aug_mask    = torch.rot90(aug_mask,    k, dims=(2,3))
-
-    # 2) Random Crop
-    if random.random() < crop_prob:
-        # 采一次随机比例
-        rw = random.uniform(*crop_range)
-        rh = random.uniform(*crop_range)
-        new_w = int(W * rw)
-        new_h = int(H * rh)
-        left   = random.randint(0, W - new_w)
-        top    = random.randint(0, H - new_h)
-        right  = left + new_w
-        bottom = top  + new_h
-
-        aug_image   = aug_image[..., top:bottom, left:right]
-        aug_rebuild = aug_rebuild[..., top:bottom, left:right]
-        aug_mask    = aug_mask[..., top:bottom, left:right]
-
-        # 更新 H, W 供后续 scale 使用
-        _, _, H, W = aug_image.shape
-
-    # 3) Random Scale
-    if random.random() < scale_prob:
-        sw = random.uniform(*scale_range)
-        sh = random.uniform(*scale_range)
-        new_w = max(1, int(W * sw))
-        new_h = max(1, int(H * sh))
-
-        aug_image   = F.interpolate(aug_image,   size=(new_h, new_w), mode='bilinear',   align_corners=False)
-        aug_rebuild = F.interpolate(aug_rebuild, size=(new_h, new_w), mode='bilinear',   align_corners=False)
-        aug_mask    = F.interpolate(aug_mask,    size=(new_h, new_w), mode='nearest')
-
-    return aug_image, aug_rebuild, aug_mask

@@ -180,3 +180,42 @@ class RefinementLoss(nn.Module):
                            10 * self.l1( mask2 * output, mask2 * gt) + 12 * self.l1(mask3 * output, mask3 * gt))
 
         return refinement_loss
+
+
+class DistillationLoss(nn.Module):
+    """
+    Distill only final image output and mask logits with L2(MSE) loss.
+    """
+    def __init__(self):
+        super(DistillationLoss, self).__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, student_output, student_mm, teacher_output, teacher_mm):
+        teacher_output = teacher_output.detach()
+        teacher_mm = teacher_mm.detach()
+
+        output_loss = self.mse(student_output, teacher_output)
+        mask_loss = self.mse(student_mm, teacher_mm)
+        return output_loss, mask_loss
+
+
+def deep_feature_l2_loss(student_deep, teacher_deep):
+    return F.mse_loss(student_deep, teacher_deep)
+
+
+def deep_feature_at_loss(student_deep, teacher_deep, eps=1e-12):
+    """
+    Attention Transfer:
+      A(F) = normalize(mean(F^2, dim=1), p=2)
+    """
+    teacher_deep = teacher_deep.detach()
+    att_s = torch.mean(student_deep.pow(2), dim=1, keepdim=True)
+    att_t = torch.mean(teacher_deep.pow(2), dim=1, keepdim=True)
+
+    att_s = att_s.flatten(1)
+    att_t = att_t.flatten(1)
+
+    att_s = att_s / (att_s.norm(p=2, dim=1, keepdim=True) + eps)
+    att_t = att_t / (att_t.norm(p=2, dim=1, keepdim=True) + eps)
+
+    return F.mse_loss(att_s, att_t)

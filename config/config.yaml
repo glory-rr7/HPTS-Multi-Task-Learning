@@ -1,6 +1,6 @@
 run:  # 程序运行通用配置
 
-  # 三种模式  训练：train    测试评估：evaluate    单张图像擦除：predict
+  # 四种模式  训练：train    蒸馏训练：train_distill    测试评估：evaluate    单张图像擦除：predict
   type: predict
 
   # random seed
@@ -29,8 +29,55 @@ custom:  # 使用custom自定义模型的相关参数
   # 注意力机制包含 ca,cbam,ela,eca,se,sa
   am: ela # 注意力机制模块，经过实验证明，通道/空间注意力机制模块更好,因此不提供self-attn和non-local
 
+
+distill:  # 仅 run.type=train_distill 时生效
+  teacher_model: 'Release'
+  student_model: 'Release_lightly_extra'
+  teacher_model_path: './data/train/Release_mixed98_20250909_v0/models/60.pth'
+
+  # 当 teacher_model 或 student_model 为 Custom 时，可分别提供独立参数
+  # teacher_custom:
+  #   base: 64
+  #   refinement: True
+  #   ffp: True
+  #   ppm: True
+  #   down_sample: 1.0
+  #   am: ela
+  # student_custom:
+  #   base: 32
+  #   refinement: False
+  #   ffp: False
+  #   ppm: False
+  #   down_sample: 0.5
+  #   am: ela
+
+  # 学生模型是否先加载初始化权重（可选）
+  student_pretrained:
+    use: False
+    model_path: './data/train/Release_lightly_extra_init/models/0.pth'
+
+  # Deep监督位置固定为ppm_post：
+  # - Release: ppm输出
+  # - Release_lightly/Release_lightly_extra/Custom: down4输出
+  deep_feature_tap: ppm_post
+
+  # deep对齐方法：l2 | at
+  deep_method: l2
+
+  # 损失权重，默认 task:deep:output:mm = 1:1:1:1
+  loss_weights:
+    task: 1.0
+    deep: 1.0
+    output: 1.0
+    mm: 1.0
+
+  # deep_method=l2 时生效：teacher侧 Conv1x1(Ct->Cs)
+  adapter:
+    teacher_conv1x1:
+      trainable: True
+
 train:
-  aug: False  #增强数据，包括旋转、裁剪和放缩，因为放缩可能导致显存变化，确保显存是不增强时的约1.5倍才能使用
+  aug: False  # 数据增强开关：在 dataset 中以 60% 概率触发一次增强，并在5种方法中等概率选择1种；不再使用旧的 crop/scale 增强
 
   pretrained:  # 使用预训练模型
     use: True
@@ -65,4 +112,3 @@ evaluate:               # 测试评估，评估模型性能，只有批次为1�
   batch_size: 1
   numberworks: 1
   dataset_path: './datasets/truedata/test'
-
