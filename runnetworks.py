@@ -119,6 +119,12 @@ class RunNetworks():
     def train(self):
         print("Epoch:", self.config['train']['epochs'], "  Batch size:",
               self.config['train']['batch_size'])
+        train_roots = self._resolve_dataset_roots(
+            self.config['train']['dataset_path'], "train.dataset_path"
+        )
+        val_roots = self._resolve_dataset_roots(
+            self.config['validation']['dataset_path'], "validation.dataset_path"
+        )
         # Info path
         # 创建相关路径
         save_models_dir = os.path.join(str(self.data_root_path), str('models'))
@@ -149,7 +155,7 @@ class RunNetworks():
 
             traindataset = DataLoader(
                 BlockSegImageDataset(
-                    root=self.config['train']['dataset_path'],
+                    root=train_roots,
                     mode="train",
                     tile_size=self.config['run']['data_crop'] ['size'],
                     use_aug=self.config['train']['aug'],
@@ -160,21 +166,21 @@ class RunNetworks():
                 num_workers=self.config['train']['numberworks'])
 
             valdataset=BlockSegImageDataset(
-                root=self.config['validation']['dataset_path'],
+                root=val_roots,
                 mode="validation",
                 tile_size=self.config['run']['data_crop'] ['size'],
                 use_aug=False,
             )
             valdataloader = DataLoader(
                 valdataset,
-                batch_size=self.config['validation']['numberworks'],
+                batch_size=self.config['validation']['batch_size'],
                 shuffle=True,
                 num_workers=self.config['validation']['numberworks'])
 
         else:
             traindataset = DataLoader(
                 SegImageDataset(
-                    root=self.config['train']['dataset_path'],
+                    root=train_roots,
                     mode="train",
                     use_aug=self.config['train']['aug'],
                 ),
@@ -184,7 +190,7 @@ class RunNetworks():
                 num_workers=self.config['train']['numberworks'],
                 pin_memory=True)
             valdataset=SegImageDataset(
-                root=self.config['validation']['dataset_path'],
+                root=val_roots,
                 mode="validation",
                 use_aug=False,
             )
@@ -347,6 +353,12 @@ class RunNetworks():
         distill_cfg = self.config['distill']
         loss_weights = distill_cfg['loss_weights']
         print("Distill Epoch:", train_cfg['epochs'], "  Batch size:", train_cfg['batch_size'])
+        train_roots = self._resolve_dataset_roots(
+            train_cfg['dataset_path'], "train.dataset_path"
+        )
+        val_roots = self._resolve_dataset_roots(
+            self.config['validation']['dataset_path'], "validation.dataset_path"
+        )
 
         save_models_dir = os.path.join(str(self.data_root_path), str('models'))
         save_samples_dir = os.path.join(str(self.data_root_path), str('samples'))
@@ -359,7 +371,7 @@ class RunNetworks():
         if self.config['run']['data_crop']['use']:
             traindataset = DataLoader(
                 BlockSegImageDataset(
-                    root=train_cfg['dataset_path'],
+                    root=train_roots,
                     mode="train",
                     tile_size=self.config['run']['data_crop']['size'],
                     use_aug=train_cfg['aug'],
@@ -370,7 +382,7 @@ class RunNetworks():
                 num_workers=train_cfg['numberworks']
             )
             valdataset = BlockSegImageDataset(
-                root=self.config['validation']['dataset_path'],
+                root=val_roots,
                 mode="validation",
                 tile_size=self.config['run']['data_crop']['size'],
                 use_aug=False,
@@ -384,7 +396,7 @@ class RunNetworks():
         else:
             traindataset = DataLoader(
                 SegImageDataset(
-                    root=train_cfg['dataset_path'],
+                    root=train_roots,
                     mode="train",
                     use_aug=train_cfg['aug'],
                 ),
@@ -395,7 +407,7 @@ class RunNetworks():
                 pin_memory=True
             )
             valdataset = SegImageDataset(
-                root=self.config['validation']['dataset_path'],
+                root=val_roots,
                 mode="validation",
                 use_aug=False,
             )
@@ -639,6 +651,9 @@ class RunNetworks():
         # Log file
         # 创建日志文件
         save_logs_path = os.path.join(str(self.data_root_path), str('logs.csv'))
+        eval_roots = self._resolve_dataset_roots(
+            self.config['evaluate']['dataset_path'], "evaluate.dataset_path"
+        )
 
         # Init logs file
         # 初始化评估的日志文件
@@ -661,7 +676,7 @@ class RunNetworks():
         if self.config['run']['data_crop']['use'] :
             evaldataset = DataLoader(
                 BlockSegImageDataset(
-                    root=self.config['evaluate']['dataset_path'],
+                    root=eval_roots,
                     mode="evaluate",
                     tile_size=self.config['run']['data_crop'] ['size'],
                     use_aug=False,
@@ -674,7 +689,7 @@ class RunNetworks():
         else:
             evaldataset = DataLoader(
                 SegImageDataset(
-                    root=self.config['evaluate']['dataset_path'],
+                    root=eval_roots,
                     mode="evaluate",
                     use_aug=False,
                 ),
@@ -999,6 +1014,30 @@ class RunNetworks():
             return deep_feature_l2_loss(student_deep, teacher_mapped)
 
         raise RuntimeError(f"Error: unknown deep_method `{self.deep_method}`.")
+
+
+    def _resolve_dataset_roots(self, dataset_path, cfg_key):
+        if isinstance(dataset_path, (str, os.PathLike)):
+            roots = [os.fspath(dataset_path)]
+        elif isinstance(dataset_path, (list, tuple)):
+            roots = [
+                os.fspath(path) for path in dataset_path
+                if isinstance(path, (str, os.PathLike)) and str(path).strip()
+            ]
+        else:
+            raise RuntimeError(
+                f"Error: `{cfg_key}` should be a path string or a yaml list of path strings."
+            )
+
+        if not roots:
+            raise RuntimeError(f"Error: `{cfg_key}` is empty.")
+
+        missing_paths = [path for path in roots if not os.path.isdir(path)]
+        if missing_paths:
+            raise RuntimeError(f"Error: dataset path(s) not found for `{cfg_key}`: {missing_paths}")
+
+        print(f"{cfg_key} roots ({len(roots)}): {roots}")
+        return roots
 
 
 

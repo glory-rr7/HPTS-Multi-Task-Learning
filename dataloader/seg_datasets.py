@@ -1,6 +1,7 @@
 import glob
 import os
 import random
+from os import PathLike
 
 import torch
 import torchvision.transforms as transforms
@@ -8,6 +9,21 @@ import torchvision.io as tvio
 from torch.utils.data import Dataset, DataLoader
 
 from dataloader.augmentation import apply_random_augmentation
+
+
+def _normalize_roots(root):
+    """Accept str or yaml list for dataset roots."""
+    if isinstance(root, (str, PathLike)):
+        roots = [os.fspath(root)]
+    elif isinstance(root, (list, tuple)):
+        roots = [os.fspath(p) for p in root if isinstance(p, (str, PathLike)) and str(p).strip()]
+    else:
+        raise TypeError("`root` must be a string path or a list/tuple of paths.")
+
+    if not roots:
+        raise ValueError("No valid dataset path is provided in `root`.")
+
+    return roots
 
 
 class SegImageDataset(Dataset):
@@ -18,33 +34,53 @@ class SegImageDataset(Dataset):
         )
         self.use_aug = use_aug
         self.aug_prob = aug_prob
+        self.roots = _normalize_roots(root)
 
-        image_dir = os.path.join(root, 'images')
-        rebuild_dir = os.path.join(root, 'rebuild')
-        label_dir = os.path.join(root, 'labels')
-        print(image_dir, rebuild_dir, label_dir)
+        self.samples = []
+        for root_path in self.roots:
+            image_dir = os.path.join(root_path, 'images')
+            rebuild_dir = os.path.join(root_path, 'rebuild')
+            label_dir = os.path.join(root_path, 'labels')
+            print(image_dir, rebuild_dir, label_dir)
 
-        image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
-        image_names = [os.path.splitext(os.path.basename(f))[0] for f in image_files]
+            image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
+            rebuild_dict = {
+                os.path.splitext(os.path.basename(f))[0]: f
+                for f in glob.glob(os.path.join(rebuild_dir, "*.png"))
+            }
+            label_dict = {
+                os.path.splitext(os.path.basename(f))[0]: f
+                for f in glob.glob(os.path.join(label_dir, "*.png"))
+            }
 
-        self.image_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in image_files}
-        self.rebuild_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in
-                             glob.glob(os.path.join(rebuild_dir, "*.png"))}
-        self.label_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in
-                           glob.glob(os.path.join(label_dir, "*.png"))}
+            valid_count = 0
+            for image_path in image_files:
+                name = os.path.splitext(os.path.basename(image_path))[0]
+                rebuild_path = rebuild_dict.get(name)
+                label_path = label_dict.get(name)
+                if rebuild_path is None or label_path is None:
+                    continue
+                self.samples.append({
+                    "image": image_path,
+                    "rebuild": rebuild_path,
+                    "label": label_path,
+                })
+                valid_count += 1
 
-        self.valid_image_names = [name for name in image_names if
-                                  name in self.rebuild_dict and name in self.label_dict]
+            print(f"{mode} image files in {root_path}: {valid_count}")
 
-        print(f"{mode} image files: {len(self.valid_image_names)}")
+        if not self.samples:
+            raise RuntimeError(f"No valid samples found for mode={mode}, roots={self.roots}.")
+
+        print(f"{mode} total image files: {len(self.samples)}")
 
     def __getitem__(self, index):
-        file_name = self.valid_image_names[index]
+        sample = self.samples[index]
 
         # read_image 直接返回 (C, H, W) uint8 tensor，比 PIL 快
-        img = tvio.read_image(self.image_dict[file_name])      # (3, H, W)
-        reb = tvio.read_image(self.rebuild_dict[file_name])     # (3, H, W)
-        label = tvio.read_image(self.label_dict[file_name])     # (1, H, W) 灰度，值 0~3
+        img = tvio.read_image(sample["image"])      # (3, H, W)
+        reb = tvio.read_image(sample["rebuild"])     # (3, H, W)
+        label = tvio.read_image(sample["label"])     # (1, H, W) 灰度，值 0~3
 
         # 处理可能的 4 通道（RGBA）
         if img.shape[0] == 4:
@@ -71,7 +107,7 @@ class SegImageDataset(Dataset):
         return img, reb, label
 
     def __len__(self):
-        return len(self.valid_image_names)
+        return len(self.samples)
 
 
 def random_flip(img, reb, label):

@@ -1,6 +1,7 @@
 import glob
 import os
 import random
+from os import PathLike
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -9,6 +10,21 @@ import torchvision.transforms as T
 from PIL import Image
 
 from dataloader.augmentation import apply_random_augmentation
+
+
+def _normalize_roots(root):
+    """Accept str or yaml list for dataset roots."""
+    if isinstance(root, (str, PathLike)):
+        roots = [os.fspath(root)]
+    elif isinstance(root, (list, tuple)):
+        roots = [os.fspath(p) for p in root if isinstance(p, (str, PathLike)) and str(p).strip()]
+    else:
+        raise TypeError("`root` must be a string path or a list/tuple of paths.")
+
+    if not roots:
+        raise ValueError("No valid dataset path is provided in `root`.")
+
+    return roots
 
 
 class BlockSegImageDataset(Dataset):
@@ -20,39 +36,59 @@ class BlockSegImageDataset(Dataset):
         self.tile_size = tile_size
         self.use_aug = use_aug
         self.aug_prob = aug_prob
+        self.roots = _normalize_roots(root)
 
-        image_dir = os.path.join(root, 'images')
-        rebuild_dir = os.path.join(root, 'rebuild')
-        label_dir = os.path.join(root, 'labels')
+        self.samples = []
+        for root_path in self.roots:
+            image_dir = os.path.join(root_path, 'images')
+            rebuild_dir = os.path.join(root_path, 'rebuild')
+            label_dir = os.path.join(root_path, 'labels')
 
-        image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
-        image_names = [os.path.splitext(os.path.basename(f))[0] for f in image_files]
+            image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
+            rebuild_dict = {
+                os.path.splitext(os.path.basename(f))[0]: f
+                for f in glob.glob(os.path.join(rebuild_dir, "*.png"))
+            }
+            label_dict = {
+                os.path.splitext(os.path.basename(f))[0]: f
+                for f in glob.glob(os.path.join(label_dir, "*.png"))
+            }
 
-        self.image_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in image_files}
-        self.rebuild_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in
-                             glob.glob(os.path.join(rebuild_dir, "*.png"))}
-        self.label_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in
-                           glob.glob(os.path.join(label_dir, "*.png"))}
+            valid_count = 0
+            for image_path in image_files:
+                name = os.path.splitext(os.path.basename(image_path))[0]
+                rebuild_path = rebuild_dict.get(name)
+                label_path = label_dict.get(name)
+                if rebuild_path is None or label_path is None:
+                    continue
+                self.samples.append({
+                    "image_path": image_path,
+                    "rebuild_path": rebuild_path,
+                    "label_path": label_path,
+                })
+                valid_count += 1
 
-        self.valid_image_names = [name for name in image_names if
-                                  name in self.rebuild_dict and name in self.label_dict]
+            print(f"{mode} image files in {root_path}: {valid_count}")
+
+        if not self.samples:
+            raise RuntimeError(f"No valid samples found for mode={mode}, roots={self.roots}.")
 
         self.tiles_info = []
         self._prepare_tiles()
 
-        print(f"{mode} image files: {len(self.valid_image_names)}")
+        print(f"{mode} total image files: {len(self.samples)}")
         print(f"Total tiles: {len(self.tiles_info)}")
 
     def _prepare_tiles(self):
         """为每个图像分割成小块并记录每个小块的位置信息"""
-        for image_name in self.valid_image_names:
-            image_path = self.image_dict[image_name]
-            rebuild_path = self.rebuild_dict[image_name]
-            label_path = self.label_dict[image_name]
+        for sample in self.samples:
+            image_path = sample['image_path']
+            rebuild_path = sample['rebuild_path']
+            label_path = sample['label_path']
 
             # 只读尺寸，不解码像素
-            image = Image.open(image_path)
-            img_width, img_height = image.size
+            with Image.open(image_path) as image:
+                img_width, img_height = image.size
 
             positions = self._split_image(img_width, img_height)
 
