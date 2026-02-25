@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.resnet import Bottleneck,BasicBlock,conv1x1,conv3x3
 from typing import  Type, Union
-from networks import ConvWithActivation, get_pad, DeConvWithActivation,DoubleConv,Up,PPM,FFP,OutConv,adjust_size, ELA
+from models.networks import ConvWithActivation, get_pad, DeConvWithActivation,DoubleConv,Up,PPM,FFP,OutConv,adjust_size, ELA
 
 
 
