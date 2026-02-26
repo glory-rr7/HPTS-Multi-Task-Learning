@@ -961,13 +961,31 @@ class RunNetworks():
         if student_pretrained_cfg.get('use', False):
             student_model_path = student_pretrained_cfg['model_path']
             self.student_model.load_state_dict(torch.load(student_model_path), strict=False)
-            # Try to resume sidecar adapter checkpoint.
+            # Legacy behavior: try to resume sidecar adapter checkpoint.
             self.adapter_resume_path = os.path.splitext(student_model_path)[0] + '_adapter.pth'
             if not os.path.exists(self.adapter_resume_path):
                 self.adapter_resume_path = None
 
         adapter_cfg = distill_cfg.get('adapter', {}).get('teacher_conv1x1', {})
         self.teacher_adapter_trainable = adapter_cfg.get('trainable', True)
+        # Explicit adapter checkpoint has higher priority than legacy sidecar auto-detection.
+        adapter_resume_cfg = adapter_cfg.get('resume', {})
+        if isinstance(adapter_resume_cfg, dict) and adapter_resume_cfg.get('use', False):
+            explicit_adapter_path = str(adapter_resume_cfg.get('path', '')).strip()
+            if not explicit_adapter_path:
+                raise RuntimeError(
+                    "Error: `distill.adapter.teacher_conv1x1.resume.path` is required when resume.use is True."
+                )
+            if not os.path.exists(explicit_adapter_path):
+                raise RuntimeError(f"Error: adapter checkpoint not found: {explicit_adapter_path}")
+            self.adapter_resume_path = explicit_adapter_path
+        else:
+            # Compatible with a flat field: adapter.teacher_conv1x1.resume_path
+            explicit_adapter_path = str(adapter_cfg.get('resume_path', '')).strip()
+            if explicit_adapter_path:
+                if not os.path.exists(explicit_adapter_path):
+                    raise RuntimeError(f"Error: adapter checkpoint not found: {explicit_adapter_path}")
+                self.adapter_resume_path = explicit_adapter_path
 
         self._register_deep_hooks()
 

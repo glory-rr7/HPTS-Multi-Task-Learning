@@ -75,6 +75,11 @@ distill:  # 仅 run.type=train_distill 时生效
   adapter:
     teacher_conv1x1:
       trainable: True
+      # 显式恢复 teacher 1x1 adapter 权重（优先级高于 student_pretrained 自动同名加载）
+      resume:
+        use: False
+        path: './data/train_distill/your_run_id/models/20_adapter.pth'
+      # 兼容旧写法（可选）：resume_path: './data/train_distill/your_run_id/models/20_adapter.pth'
 
 train:
   aug: False  # 数据增强开关：在 dataset 中以 60% 概率触发一次增强，并在5种方法中等概率选择1种；不再使用旧的 crop/scale 增强
@@ -90,7 +95,10 @@ train:
   learning_rate: 0.0002 # 学习率,别调太大，通常小于0.001
   batch_size: 4       # 批次大小，因为有用到batch normal，所以建议不要把batch size设置成1，会报错
   numberworks: 8        # 线程数，需要预处理的图像可能会比较耗时，线程数可以开大点，单张显卡对应4-8个线程是符合经验的选择
-  dataset_path: './datasets/mixed_25.9.8/train'
+  # 支持单路径字符串，或标准 YAML 列表（推荐）
+  dataset_path:
+    - './datasets/mixed_25.9.8/train'
+    # - './datasets/another_dataset/train'
   #path: "./dataset/threetags"
 
   mult_stage_loss:      # 多阶段损失，开启多阶段损失后，会在设定批次之后开始专注于输出模块的性能，忽略过程中其他模块的性能
@@ -98,7 +106,9 @@ train:
     epoch: 2            # 多阶段损失开始训练的批次
 
 validation:             # 验证集配置，训练的每一个批次训练完成之后，会验证一次模型，也就是在模型没有见过的模型上简单测试一下性能
-  dataset_path: './datasets/mixed_25.9.8/val'
+  dataset_path:
+    - './datasets/mixed_25.9.8/val'
+    # - './datasets/another_dataset/val'
   batch_size: 4
   numberworks: 4
 
@@ -111,4 +121,6 @@ evaluate:               # 测试评估，评估模型性能，只有批次为1�
   model_path: './data/train/Release_threetags_20250719_v0/models/200.pth'
   batch_size: 1
   numberworks: 1
-  dataset_path: './datasets/truedata/test'
+  dataset_path:
+    - './datasets/truedata/test'
+    # - './datasets/another_dataset/test'
