@@ -117,10 +117,11 @@ class RunNetworks():
             raise RuntimeError("Error: work type wrong!")
 
     def train(self):
-        print("Epoch:", self.config['train']['epochs'], "  Batch size:",
-              self.config['train']['batch_size'])
+        train_cfg = self.config['train']
+        print("Epoch:", train_cfg['epochs'], "  Batch size:",
+              train_cfg['batch_size'])
         train_roots = self._resolve_dataset_roots(
-            self.config['train']['dataset_path'], "train.dataset_path"
+            train_cfg['dataset_path'], "train.dataset_path"
         )
         val_roots = self._resolve_dataset_roots(
             self.config['validation']['dataset_path'], "validation.dataset_path"
@@ -138,8 +139,8 @@ class RunNetworks():
 
         # Use pretrained model
         # 如果需要使用预训练的模型，则加载预训练的模型
-        if self.config['train']['pretrained']['use']:
-            model_path = self.config['train']['pretrained']['model_path']
+        if train_cfg['pretrained']['use']:
+            model_path = train_cfg['pretrained']['model_path']
             self.model.load_state_dict(torch.load(model_path), strict=False)
 
         # Loss
@@ -158,12 +159,12 @@ class RunNetworks():
                     root=train_roots,
                     mode="train",
                     tile_size=self.config['run']['data_crop'] ['size'],
-                    use_aug=self.config['train']['aug'],
+                    use_aug=train_cfg['aug'],
                 ),
-                batch_size=self.config['train']['batch_size'],
+                batch_size=train_cfg['batch_size'],
                 shuffle=True,
                 drop_last=True,
-                num_workers=self.config['train']['numberworks'])
+                num_workers=train_cfg['numberworks'])
 
             valdataset=BlockSegImageDataset(
                 root=val_roots,
@@ -182,12 +183,12 @@ class RunNetworks():
                 SegImageDataset(
                     root=train_roots,
                     mode="train",
-                    use_aug=self.config['train']['aug'],
+                    use_aug=train_cfg['aug'],
                 ),
-                batch_size=self.config['train']['batch_size'],
+                batch_size=train_cfg['batch_size'],
                 drop_last=True,
                 shuffle=True,
-                num_workers=self.config['train']['numberworks'],
+                num_workers=train_cfg['numberworks'],
                 pin_memory=True)
             valdataset=SegImageDataset(
                 root=val_roots,
@@ -203,7 +204,8 @@ class RunNetworks():
 
         # Optimizer
         # 创建优化器
-        G_optimizer = optim.Adam(self.model.parameters(), lr=self.config['train']['learning_rate'], betas=(0.9, 0.999))
+        G_optimizer = optim.Adam(self.model.parameters(), lr=train_cfg['learning_rate'], betas=(0.9, 0.999))
+        lr_schedule_map = self._parse_lr_schedule_map(train_cfg)
 
         # Calculate time
         # 计算时间
@@ -220,8 +222,9 @@ class RunNetworks():
 
         REFINEMENT = False
         #训练
-        for epochs in range(1, self.config['train']['epochs'] + 1):
-            if epochs ==  self.config['train']['mult_stage_loss']['epoch'] and self.config['train']['mult_stage_loss']['use']:
+        for epochs in range(1, train_cfg['epochs'] + 1):
+            self._apply_lr_schedule(G_optimizer, epochs, lr_schedule_map)
+            if epochs ==  train_cfg['mult_stage_loss']['epoch'] and train_cfg['mult_stage_loss']['use']:
                 criterion = RefinementLoss().to(self.device)
                 print("change loss")
                 REFINEMENT = True
@@ -302,7 +305,7 @@ class RunNetworks():
                 # Print information
                 # 更新进度显示
                 sys.stdout.write(
-                    f"\rEpoch: [{epochs}/{self.config['train']['epochs']}] "
+                    f"\rEpoch: [{epochs}/{train_cfg['epochs']}] "
                     f"Batch: [{idx + 1}/{len(traindataset)}] "
                     f"Epoch Avg Loss: {epoch_loss / (idx + 1):.4f} "
                     f"L1 Loss: {epoch_L1_loss / (idx + 1):.4f} "
@@ -310,7 +313,8 @@ class RunNetworks():
                     f"PSNR: {epoch_psnr / (idx + 1):.4f} "
                     f"Avg time/batch: {avg_batch_time:.3f}s "
                     f"Elapsed: {formatted_elapsed} "
-                    f"ETA: {formatted_eta}  "
+                    f"ETA: {formatted_eta} "
+                    f"LR: {G_optimizer.param_groups[0]['lr']:.6g}  "
                 )
                 sys.stdout.flush()
                 pre_time = time.time()
@@ -338,12 +342,12 @@ class RunNetworks():
 
             # Save sample images
             # 保存样例图片
-            if (epochs % self.config['train']['sample_save_every'] == 0):
+            if (epochs % train_cfg['sample_save_every'] == 0):
                 sample_images(valdataset, self.model, os.path.join(save_samples_dir, str(epochs) + '.png'))
 
             # Save model
             # 保存模型
-            if (epochs % self.config['train']['model_save_every'] == 0):
+            if (epochs % train_cfg['model_save_every'] == 0):
                  torch.save(self.model.state_dict(), os.path.join(save_models_dir, str(epochs) + '.pth'))
 
             print()
@@ -428,6 +432,7 @@ class RunNetworks():
             lr=train_cfg['learning_rate'],
             betas=(0.9, 0.999)
         )
+        lr_schedule_map = self._parse_lr_schedule_map(train_cfg)
 
         recent_times = collections.deque(maxlen=len(traindataset) + 1)
         start_time = time.time()
@@ -439,6 +444,7 @@ class RunNetworks():
             torch.save(self.teacher_adapter.state_dict(), os.path.join(save_models_dir, str(0) + '_adapter.pth'))
 
         for epochs in range(1, train_cfg['epochs'] + 1):
+            self._apply_lr_schedule(optimizer, epochs, lr_schedule_map)
             torch.cuda.empty_cache()
             epoch_loss_total = 0.0
             epoch_loss_task = 0.0
@@ -539,7 +545,8 @@ class RunNetworks():
                     f"PSNR: {epoch_psnr / (idx + 1):.4f} "
                     f"Avg time/batch: {avg_batch_time:.3f}s "
                     f"Elapsed: {formatted_elapsed} "
-                    f"ETA: {formatted_eta}  "
+                    f"ETA: {formatted_eta} "
+                    f"LR: {optimizer.param_groups[0]['lr']:.6g}  "
                 )
                 sys.stdout.flush()
                 pre_time = time.time()
@@ -1032,6 +1039,65 @@ class RunNetworks():
             return deep_feature_l2_loss(student_deep, teacher_mapped)
 
         raise RuntimeError(f"Error: unknown deep_method `{self.deep_method}`.")
+
+    def _parse_lr_schedule_map(self, train_cfg):
+        lr_schedule_cfg = train_cfg.get('lr_schedule', {})
+        if not isinstance(lr_schedule_cfg, dict) or not lr_schedule_cfg.get('use', False):
+            return {}
+
+        steps = lr_schedule_cfg.get('steps', [])
+        if not isinstance(steps, list):
+            raise RuntimeError("Error: `train.lr_schedule.steps` must be a list.")
+
+        schedule_map = {}
+        for idx, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise RuntimeError(f"Error: `train.lr_schedule.steps[{idx}]` must be a dict.")
+
+            epoch = step.get('epoch', None)
+            lr = step.get('lr', None)
+            if epoch is None or lr is None:
+                raise RuntimeError(
+                    f"Error: `train.lr_schedule.steps[{idx}]` must include both `epoch` and `lr`."
+                )
+
+            try:
+                epoch = int(epoch)
+                lr = float(lr)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    f"Error: invalid schedule item at index {idx}, epoch={epoch}, lr={lr}."
+                )
+
+            if epoch < 1:
+                raise RuntimeError(f"Error: `train.lr_schedule.steps[{idx}].epoch` must be >= 1.")
+            if lr <= 0:
+                raise RuntimeError(f"Error: `train.lr_schedule.steps[{idx}].lr` must be > 0.")
+            if epoch in schedule_map:
+                raise RuntimeError(f"Error: duplicated lr schedule epoch: {epoch}.")
+
+            schedule_map[epoch] = lr
+
+        if schedule_map:
+            schedule_text = ", ".join(
+                [f"epoch {ep}->{value:.6g}" for ep, value in sorted(schedule_map.items())]
+            )
+            print(f"LR schedule enabled: {schedule_text}")
+        else:
+            print("LR schedule enabled but no step provided; keep constant learning rate.")
+        return schedule_map
+
+    def _apply_lr_schedule(self, optimizer, epoch, schedule_map):
+        if epoch not in schedule_map:
+            return
+
+        new_lr = schedule_map[epoch]
+        old_lrs = sorted({float(group['lr']) for group in optimizer.param_groups})
+        for group in optimizer.param_groups:
+            group['lr'] = new_lr
+
+        old_lr_text = "/".join([f"{value:.6g}" for value in old_lrs]) if old_lrs else "N/A"
+        print(f"\n[LR] epoch {epoch}: {old_lr_text} -> {new_lr:.6g}")
 
 
     def _resolve_dataset_roots(self, dataset_path, cfg_key):

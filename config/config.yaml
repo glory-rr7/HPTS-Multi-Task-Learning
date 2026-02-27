@@ -93,6 +93,13 @@ train:
   model_save_every: 2  # 模型保存间隔，做实验的时候间隔调适中，方便断点继续训练；应用场景下，间隔调小一点，精确使用效果最好的模型
   sample_save_every: 1  # 样本保存间隔，默认1就行
   learning_rate: 0.0002 # 学习率,别调太大，通常小于0.001
+  lr_schedule:          # 按 epoch 动态调整学习率（同时作用于 train / train_distill）
+    use: False
+    steps:
+      - epoch: 20
+        lr: 0.0001
+      - epoch: 40
+        lr: 0.00005
   batch_size: 4       # 批次大小，因为有用到batch normal，所以建议不要把batch size设置成1，会报错
   numberworks: 8        # 线程数，需要预处理的图像可能会比较耗时，线程数可以开大点，单张显卡对应4-8个线程是符合经验的选择
   # 支持单路径字符串，或标准 YAML 列表（推荐）
