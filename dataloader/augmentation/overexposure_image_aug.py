@@ -95,8 +95,8 @@ def _apply_overexposure(img_rgb: np.ndarray, params, rng: random.Random, np_rng:
 
 def apply_overexposure_image(
     data: Dict[str, torch.Tensor],
-    strength: float = 0.7,
-    strength_jitter: float = 0.15,
+    strength: float = 0.35,
+    strength_jitter: float = 0.08,
 ) -> Dict[str, torch.Tensor]:
     """
     过曝光增强，仅修改 image，mask/rebuild 原样返回。

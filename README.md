@@ -210,6 +210,13 @@ train:
   epochs: 50
   batch_size: 4
   learning_rate: 0.0002
+  lr_schedule:
+    use: False
+    steps:
+      - epoch: 20
+        lr: 0.0001
+      - epoch: 40
+        lr: 0.00005
   pretrained:
     use: True
     model_path: './data/train/.../models/60.pth'

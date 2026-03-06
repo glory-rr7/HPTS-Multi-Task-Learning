@@ -68,7 +68,7 @@ def _random_region_jitter_map(
             dx = cv2.GaussianBlur(dx, (0, 0), sigma)
             dy = cv2.GaussianBlur(dy, (0, 0), sigma)
 
-            amp = rng.uniform(1.0, max_amplitude)
+            amp = rng.uniform(1.2, max_amplitude)
             dx_total += dx * amp
             dy_total += dy * amp
 
@@ -96,7 +96,7 @@ def apply_scaning_local_jitter(
     data: Dict[str, torch.Tensor],
     num_regions_range=(2, 5),
     area_ratio=(0.08, 0.25),
-    max_amplitude_range=(2.0, 5.0),
+    max_amplitude_range=(2.5, 6.0),
     sigma_range=(6.0, 10.0),
     field_num_range=(2, 5),
 ) -> Dict[str, torch.Tensor]:

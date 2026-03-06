@@ -98,10 +98,10 @@ def _apply_remap(image: np.ndarray, map_x: np.ndarray, map_y: np.ndarray, interp
 
 def apply_local_wave_stretch(
     data: Dict[str, torch.Tensor],
-    num_waves_range=(3, 6),
-    amp_y_range=(3.0, 10.0),
+    num_waves_range=(1, 3),
+    amp_y_range=(3.0, 5.0),
     amp_x_range=(0.4, 2.0),
-    window_ratio_range=(0.12, 0.30),
+    window_ratio_range=(0.12, 0.70),
 ) -> Dict[str, torch.Tensor]:
     """
     扫描局部波动拉伸增强，同步作用于 image/mask/rebuild。

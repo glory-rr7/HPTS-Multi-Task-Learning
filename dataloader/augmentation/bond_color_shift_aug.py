@@ -9,8 +9,23 @@ def apply_bond_color_shift(
     shift_intensity: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
     """
-    颜色偏移增强，修改 image/rebuild，mask 原样返回。
-    mask 要求为单通道标签图 (1,H,W)，类别取值 0~3。
+    颜色偏移增强，按 image/rebuild 的不同语义分别处理。
+
+    mask 为单通道标签图 (1,H,W)，类别取值:
+      0: background
+      1: printed
+      2: handwriting
+      3: overlap
+
+    image:
+      - printed(1) 使用 printed 偏移
+      - handwriting(2) 使用 handwriting 偏移
+      - overlap(3) 随机归入 printed 或 handwriting
+
+    rebuild:
+      - 仅保留 background/printed 语义
+      - printed(1) 与 overlap(3) 都使用 printed 偏移
+      - handwriting(2) 视为非打印区域，不施加手写偏移
     """
     image = data["image"]
     rebuild = data["rebuild"]
@@ -20,27 +35,34 @@ def apply_bond_color_shift(
     rebuild_float = rebuild.float() / 255.0
     label_map = mask.long().squeeze(0)
 
-    assign_3_to_1 = random.random() > 0.5
-    mask_1_base = label_map == 1
-    mask_2_base = label_map == 2
-    mask_3_base = label_map == 3
+    assign_overlap_to_printed = random.random() > 0.5
+    printed_mask = label_map == 1
+    handwriting_mask = label_map == 2
+    overlap_mask = label_map == 3
 
-    if assign_3_to_1:
-        final_mask1 = mask_1_base | mask_3_base
-        final_mask2 = mask_2_base
+    if assign_overlap_to_printed:
+        image_printed_mask = printed_mask | overlap_mask
+        image_handwriting_mask = handwriting_mask
     else:
-        final_mask1 = mask_1_base
-        final_mask2 = mask_2_base | mask_3_base
+        image_printed_mask = printed_mask
+        image_handwriting_mask = handwriting_mask | overlap_mask
+
+    rebuild_printed_mask = printed_mask | overlap_mask
 
     c = image.shape[0]
-    delta_1 = (torch.rand(c, 1, 1, device=image.device, dtype=torch.float32) * 2.0 - 1.0) * shift_intensity
-    delta_2 = (torch.rand(c, 1, 1, device=image.device, dtype=torch.float32) * 2.0 - 1.0) * shift_intensity
+    printed_delta = (torch.rand(c, 1, 1, device=image.device, dtype=torch.float32) * 2.0 - 1.0) * shift_intensity
+    handwriting_delta = (torch.rand(c, 1, 1, device=image.device, dtype=torch.float32) * 2.0 - 1.0) * shift_intensity
 
-    final_mask1 = final_mask1.unsqueeze(0).expand(c, -1, -1).float().to(image.device)
-    final_mask2 = final_mask2.unsqueeze(0).expand(c, -1, -1).float().to(image.device)
+    image_printed_mask = image_printed_mask.unsqueeze(0).expand(c, -1, -1).float().to(image.device)
+    image_handwriting_mask = image_handwriting_mask.unsqueeze(0).expand(c, -1, -1).float().to(image.device)
+    rebuild_printed_mask = rebuild_printed_mask.unsqueeze(0).expand(c, -1, -1).float().to(image.device)
 
-    image_float = image_float + delta_1 * final_mask1 + delta_2 * final_mask2
-    rebuild_float = rebuild_float + delta_1 * final_mask1 + delta_2 * final_mask2
+    image_float = (
+        image_float
+        + printed_delta * image_printed_mask
+        + handwriting_delta * image_handwriting_mask
+    )
+    rebuild_float = rebuild_float + printed_delta * rebuild_printed_mask
 
     image_out = torch.clamp(torch.round(torch.clamp(image_float, 0.0, 1.0) * 255.0), 0, 255).to(dtype=image.dtype)
     rebuild_out = torch.clamp(torch.round(torch.clamp(rebuild_float, 0.0, 1.0) * 255.0), 0, 255).to(dtype=rebuild.dtype)
