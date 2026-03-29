@@ -813,7 +813,8 @@ class RunNetworks():
         # Load model
         # 加载模型
         model_path = self.config['predict']['model_path']
-        self.model.load_state_dict(torch.load(model_path), strict=False)
+        state_dict = torch.load(model_path, map_location=torch.device(self.device))
+        self.model.load_state_dict(state_dict, strict=False)
 
         # Load image
         # 加载图片
