@@ -154,6 +154,56 @@ class SegMultTaskLoss(nn.Module):
         return GLoss.sum()
 
 
+class SegMultTaskLoss3Tags(nn.Module):
+    def __init__(self):
+        super(SegMultTaskLoss3Tags, self).__init__()
+        self.l1 = nn.L1Loss()
+        weights = torch.tensor([1.0, 4.0, 5.0], dtype=torch.float32)
+        self.ce = nn.CrossEntropyLoss(weight=weights)
+
+    @staticmethod
+    def _to_three_tag_mask(mask):
+        return torch.where(mask == 3, torch.ones_like(mask), mask)
+
+    def forward(self, mask, x_o1, x_o2, x_o3, output, mm, gt, idx):
+        mask = self._to_three_tag_mask(mask)
+        mask0 = (mask == 0).float()  # 背景
+        mask1 = (mask == 1).float()  # 手写；重叠区域也映射到该类
+        mask2 = (mask == 2).float()  # 打印
+
+        refinement_loss = (2 * self.l1(mask0 * output, mask0 * gt) +
+                           8 * self.l1(mask1 * output, mask1 * gt) +
+                           10 * self.l1(mask2 * output, mask2 * gt))
+
+        mask_loss = self.ce(mm, mask.squeeze(1))
+
+        msrloss = (0.8 * self.l1(mask0 * x_o3, mask0 * gt) +
+                   4 * self.l1(mask1 * x_o3, mask1 * gt) +
+                   5 * self.l1(mask2 * x_o3, mask2 * gt))
+
+        gt = F.interpolate(gt, scale_factor=0.5)
+        mask0 = F.interpolate(mask0, scale_factor=0.5)
+        mask1 = F.interpolate(mask1, scale_factor=0.5)
+        mask2 = F.interpolate(mask2, scale_factor=0.5)
+
+        msrloss += (1 * self.l1(mask0 * x_o2, mask0 * gt) +
+                    3 * self.l1(mask1 * x_o2, mask1 * gt) +
+                    4 * self.l1(mask2 * x_o2, mask2 * gt))
+
+        gt = F.interpolate(gt, scale_factor=0.5)
+        mask0 = F.interpolate(mask0, scale_factor=0.5)
+        mask1 = F.interpolate(mask1, scale_factor=0.5)
+        mask2 = F.interpolate(mask2, scale_factor=0.5)
+
+        msrloss += (0.8 * self.l1(mask0 * x_o1, mask0 * gt) +
+                    2 * self.l1(mask1 * x_o1, mask1 * gt) +
+                    2 * self.l1(mask2 * x_o1, mask2 * gt))
+
+        GLoss = msrloss + refinement_loss + mask_loss
+
+        return GLoss.sum()
+
+
 
 
 
@@ -178,6 +228,26 @@ class RefinementLoss(nn.Module):
 
         refinement_loss = (2 * self.l1(mask0 * output, mask0 * gt) + 8 * self.l1(mask1 * output, mask1 * gt) +
                            10 * self.l1( mask2 * output, mask2 * gt) + 12 * self.l1(mask3 * output, mask3 * gt))
+
+        return refinement_loss
+
+
+class RefinementLoss3Tags(nn.Module):
+    def __init__(self):
+        super(RefinementLoss3Tags, self).__init__()
+        self.l1 = nn.L1Loss()
+
+    def forward(self, mask, output, gt, ):
+        mask = torch.where(mask == 3, torch.ones_like(mask), mask)
+        b, _, width, height = mask.shape
+
+        mask0 = (mask == 0).float().expand(b, 3, width, height)
+        mask1 = (mask == 1).float().expand(b, 3, width, height)
+        mask2 = (mask == 2).float().expand(b, 3, width, height)
+
+        refinement_loss = (2 * self.l1(mask0 * output, mask0 * gt) +
+                           8 * self.l1(mask1 * output, mask1 * gt) +
+                           10 * self.l1(mask2 * output, mask2 * gt))
 
         return refinement_loss
 

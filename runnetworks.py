@@ -16,20 +16,32 @@ import time
 from torchvision.utils import save_image
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 # from loss.Loos_light import SegMultTaskLoss,SimilarityLoss, RefinementLoss
 from loss.Loss import (
     SegMultTaskLoss,
+    SegMultTaskLoss3Tags,
     SimilarityLoss,
     RefinementLoss,
+    RefinementLoss3Tags,
     DistillationLoss,
     deep_feature_l2_loss,
     deep_feature_at_loss,
 )
-from models import Release,Release_lightly, Release_lightly_extra, Custom
+from models import Release,Release_lightly, Release_lightly_extra, Custom, Custom3Tags
 from utils import sample_images, save_tensor_as_image, split_image, ImageBlocks ,get_transformer,maskToTensor
 from dataloader.seg_datasets import SegImageDataset
 from dataloader.block_seg_datasets import BlockSegImageDataset
+from dataloader.augmentation.local_wave_stretch_aug import apply_local_wave_stretch
+from dataloader.augmentation.overexposure_image_aug import apply_overexposure_image
+from dataloader.augmentation.edge_artifact_image_aug import apply_edge_artifact_image
+from dataloader.augmentation.bond_color_shift_aug import apply_bond_color_shift
 from config.config_utils import LoadConfig
+
+
+STRATEGY_AUG_PROB = 0.6
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 
@@ -118,8 +130,14 @@ class RunNetworks():
 
     def train(self):
         train_cfg = self.config['train']
+        train_strategy = self._get_train_strategy()
+        self._validate_train_strategy(train_strategy)
         print("Epoch:", train_cfg['epochs'], "  Batch size:",
               train_cfg['batch_size'])
+        print("Train strategy:", train_strategy)
+        strategy_loss_weight = self._get_strategy_loss_weight(train_strategy)
+        if train_strategy != 'none':
+            print("Strategy loss weight:", strategy_loss_weight)
         train_roots = self._resolve_dataset_roots(
             train_cfg['dataset_path'], "train.dataset_path"
         )
@@ -145,12 +163,14 @@ class RunNetworks():
 
         # Loss
         # 创建损失函数
-        criterion = SegMultTaskLoss().to(self.device)
+        criterion = self._build_task_loss(self.model_name).to(self.device)
 
         # Train dataloader
         # 创建训练数据集，使用裁剪数据或否不使用裁剪数据
         # 具体来说，如果输入的图片是尺寸不一致的较大图片，那么必须使用裁剪
         # 如果输入的图片尺寸大小一致，可以选择性使用裁剪
+
+        dataset_use_aug = train_cfg['aug'] if train_strategy == 'none' else False
 
         if self.config['run']['data_crop']['use'] :
 
@@ -159,7 +179,7 @@ class RunNetworks():
                     root=train_roots,
                     mode="train",
                     tile_size=self.config['run']['data_crop'] ['size'],
-                    use_aug=train_cfg['aug'],
+                    use_aug=dataset_use_aug,
                 ),
                 batch_size=train_cfg['batch_size'],
                 shuffle=True,
@@ -183,7 +203,7 @@ class RunNetworks():
                 SegImageDataset(
                     root=train_roots,
                     mode="train",
-                    use_aug=train_cfg['aug'],
+                    use_aug=dataset_use_aug,
                 ),
                 batch_size=train_cfg['batch_size'],
                 drop_last=True,
@@ -225,7 +245,7 @@ class RunNetworks():
         for epochs in range(1, train_cfg['epochs'] + 1):
             self._apply_lr_schedule(G_optimizer, epochs, lr_schedule_map)
             if epochs ==  train_cfg['mult_stage_loss']['epoch'] and train_cfg['mult_stage_loss']['use']:
-                criterion = RefinementLoss().to(self.device)
+                criterion = self._build_refinement_loss(self.model_name).to(self.device)
                 print("change loss")
                 REFINEMENT = True
             torch.cuda.empty_cache()
@@ -244,20 +264,46 @@ class RunNetworks():
 
                 self.model.zero_grad()
 
-                # Get output from forward and calculate loss to train model
-                # 获取输出并计算损失以训练模型
-                if (self.model.return_num()) == 4:
-                    x_o1, x_o2, x_o3, mm = self.model(imgs)
-                    fake_images = x_o3
-                else:
-                    x_o1, x_o2, x_o3, fake_images, mm = self.model(imgs)
+                if train_strategy == 'none':
+                    # Get output from forward and calculate loss to train model
+                    # 获取输出并计算损失以训练模型
+                    if (self.model.return_num()) == 4:
+                        x_o1, x_o2, x_o3, mm = self.model(imgs)
+                        fake_images = x_o3
+                    else:
+                        x_o1, x_o2, x_o3, fake_images, mm = self.model(imgs)
 
-                if REFINEMENT:
-                    G_loss = criterion(masks,fake_images,gt)
+                    if REFINEMENT:
+                        G_loss = criterion(masks,fake_images,gt)
+                    else:
+                        G_loss = criterion(masks, x_o1, x_o2, x_o3, fake_images, mm, gt, idx)
+                    task_masks = masks
+                    task_gt = gt
                 else:
-                    G_loss = criterion(masks, x_o1, x_o2, x_o3, fake_images, mm, gt, idx)
+                    pair_imgs, pair_gt, pair_masks = self._build_strategy_pair_batch(imgs, gt, masks)
+                    if (self.model.return_num()) == 4:
+                        pair_x_o1, pair_x_o2, pair_x_o3, pair_mm = self.model(pair_imgs)
+                        pair_fake_images = pair_x_o3
+                    else:
+                        pair_x_o1, pair_x_o2, pair_x_o3, pair_fake_images, pair_mm = self.model(pair_imgs)
 
-                target = masks.squeeze(1)
+                    select_idx = self._sample_strategy_supervision_indices(imgs.shape[0], imgs.device)
+                    x_o1 = self._select_batch(pair_x_o1, select_idx)
+                    x_o2 = self._select_batch(pair_x_o2, select_idx)
+                    x_o3 = self._select_batch(pair_x_o3, select_idx)
+                    fake_images = self._select_batch(pair_fake_images, select_idx)
+                    mm = self._select_batch(pair_mm, select_idx)
+                    task_masks = self._select_batch(pair_masks, select_idx)
+                    task_gt = self._select_batch(pair_gt, select_idx)
+
+                    if REFINEMENT:
+                        task_loss = criterion(task_masks, fake_images, task_gt)
+                    else:
+                        task_loss = criterion(task_masks, x_o1, x_o2, x_o3, fake_images, mm, task_gt, idx)
+                    strategy_loss = self._compute_strategy_loss(train_strategy, imgs.shape[0])
+                    G_loss = task_loss + strategy_loss_weight * strategy_loss
+
+                target = self._mask_target_for_model(task_masks, mm).squeeze(1)
                 u = torch.unique(target)
 
                 #print("mm.shape:", mm.shape, "target dtype:", target.dtype, "target unique:", u[:20])
@@ -275,7 +321,7 @@ class RunNetworks():
                 # print('[{}/{}] Generator Loss of epoch{} is {}'.format(k, len(dataloader), i, G_loss.item()))
 
                 with torch.no_grad():
-                    L1_loss, mse_loss, psnr = SimilarityLoss(fake_images, gt,SSIM=False)
+                    L1_loss, mse_loss, psnr = SimilarityLoss(fake_images, task_gt,SSIM=False)
                     L1_loss=L1_loss.item()
                     mse_loss=mse_loss.item()
                     psnr=psnr.item()
@@ -675,7 +721,7 @@ class RunNetworks():
 
         # Loss
         # 创建损失函数
-        criterion = SegMultTaskLoss().to(self.device)
+        criterion = self._build_task_loss(self.model_name).to(self.device)
 
 
         # Train dataloader
@@ -895,9 +941,176 @@ class RunNetworks():
                 ffp=cfg['ffp'],
                 ppm=cfg['ppm'],
                 down_sample=cfg['down_sample'],
-                am=cfg['am']
+                am=cfg['am'],
+                enable_srpdg_attention=self._get_train_strategy() == 'srpdg',
+            ).to(self.device)
+        if model_name == 'Custom3Tags':
+            cfg = custom_cfg if custom_cfg is not None else self.config['custom']
+            return Custom3Tags.ResNet_UNet(
+                base=cfg['base'],
+                refinement=cfg['refinement'],
+                ffp=cfg['ffp'],
+                ppm=cfg['ppm'],
+                down_sample=cfg['down_sample'],
+                am=cfg['am'],
+                enable_srpdg_attention=self._get_train_strategy() == 'srpdg',
             ).to(self.device)
         raise RuntimeError(f"Error: Model `{model_name}` is not exist!")
+
+    def _get_train_strategy(self):
+        if getattr(self, 'worktype', None) != 'train':
+            return 'none'
+        train_cfg = self.config.get('train', {})
+        strategy_cfg = train_cfg.get('strategy', 'none')
+        if isinstance(strategy_cfg, dict):
+            strategy = strategy_cfg.get('name', 'none')
+        else:
+            strategy = strategy_cfg
+        if strategy is None:
+            strategy = 'none'
+        return str(strategy).lower()
+
+    def _validate_train_strategy(self, strategy):
+        if strategy not in ('none', 'srpdg', 'coral'):
+            raise RuntimeError("Error: train.strategy must be one of `none`, `srpdg`, or `coral`.")
+        if strategy in ('srpdg', 'coral') and self.model_name not in ('Custom', 'Custom3Tags'):
+            raise RuntimeError(f"Error: train.strategy `{strategy}` only supports Custom and Custom3Tags.")
+
+    def _denormalize_for_aug(self, tensor):
+        mean = torch.as_tensor(IMAGENET_MEAN, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
+        std = torch.as_tensor(IMAGENET_STD, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
+        tensor = (tensor * std + mean).clamp(0.0, 1.0)
+        return torch.clamp(torch.round(tensor * 255.0), 0, 255).to(torch.uint8)
+
+    def _normalize_after_aug(self, tensor):
+        tensor = tensor.float() / 255.0
+        mean = torch.as_tensor(IMAGENET_MEAN, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
+        std = torch.as_tensor(IMAGENET_STD, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
+        return (tensor - mean) / std
+
+    def _apply_shared_pair_augment(self, image, rebuild, mask):
+        data = {
+            "image": image,
+            "rebuild": rebuild,
+            "mask": mask.to(dtype=torch.uint8),
+        }
+        r = random.random()
+        if r < 0.2:
+            dims = [2]
+            data = {k: torch.flip(v, dims=dims) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        elif r < 0.4:
+            dims = [1]
+            data = {k: torch.flip(v, dims=dims) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        elif r < 0.6:
+            data = {k: torch.rot90(v, k=1, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        elif r < 0.8:
+            data = {k: torch.rot90(v, k=2, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        else:
+            data = {k: torch.rot90(v, k=3, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        return apply_local_wave_stretch(data)
+
+    def _apply_extra_view_augment(self, data):
+        aug_fns = [
+            apply_overexposure_image,
+            apply_edge_artifact_image,
+            apply_bond_color_shift,
+        ]
+        selected = [fn for fn in aug_fns if random.random() < STRATEGY_AUG_PROB]
+        if not selected:
+            selected = [random.choice(aug_fns)]
+        output = data
+        for aug_fn in selected:
+            output = aug_fn(output)
+        return output
+
+    def _build_strategy_pair_batch(self, imgs, gt, masks):
+        ori_imgs = []
+        ori_gt = []
+        ori_masks = []
+        aug_imgs = []
+        aug_gt = []
+        aug_masks = []
+
+        for image, rebuild, mask in zip(imgs, gt, masks):
+            image_u8 = self._denormalize_for_aug(image)
+            rebuild_u8 = self._denormalize_for_aug(rebuild)
+            shared = self._apply_shared_pair_augment(image_u8, rebuild_u8, mask)
+            aug = self._apply_extra_view_augment({
+                "image": shared["image"].clone(),
+                "rebuild": shared["rebuild"].clone(),
+                "mask": shared["mask"].clone(),
+            })
+
+            ori_imgs.append(self._normalize_after_aug(shared["image"]))
+            ori_gt.append(self._normalize_after_aug(shared["rebuild"]))
+            ori_masks.append(shared["mask"].long())
+            aug_imgs.append(self._normalize_after_aug(aug["image"]))
+            aug_gt.append(self._normalize_after_aug(aug["rebuild"]))
+            aug_masks.append(aug["mask"].long())
+
+        pair_imgs = torch.cat([torch.stack(ori_imgs, dim=0), torch.stack(aug_imgs, dim=0)], dim=0)
+        pair_gt = torch.cat([torch.stack(ori_gt, dim=0), torch.stack(aug_gt, dim=0)], dim=0)
+        pair_masks = torch.cat([torch.stack(ori_masks, dim=0), torch.stack(aug_masks, dim=0)], dim=0)
+        return pair_imgs, pair_gt, pair_masks
+
+    def _sample_strategy_supervision_indices(self, batch_size, device):
+        base = torch.arange(batch_size, device=device)
+        use_aug = torch.rand(batch_size, device=device) < STRATEGY_AUG_PROB
+        return base + use_aug.long() * batch_size
+
+    def _select_batch(self, tensor, indices):
+        return tensor.index_select(0, indices)
+
+    def _compute_strategy_loss(self, strategy, batch_size):
+        features = getattr(self.model, 'strategy_features', {})
+        if strategy == 'srpdg':
+            loss = 0.0
+            for key in ('attn_down2', 'attn_down3'):
+                attn = features.get(key)
+                if attn is None:
+                    raise RuntimeError(f"Error: missing `{key}` for srpdg strategy.")
+                loss = loss + F.mse_loss(attn[:batch_size], attn[batch_size:])
+            return loss
+        if strategy == 'coral':
+            loss = 0.0
+            for key in ('down2', 'down3'):
+                feature = features.get(key)
+                if feature is None:
+                    raise RuntimeError(f"Error: missing `{key}` for coral strategy.")
+                loss = loss + self._deep_coral_loss(feature[:batch_size], feature[batch_size:])
+            return loss
+        return torch.tensor(0.0, device=self.device)
+
+    def _get_strategy_loss_weight(self, strategy):
+        if strategy == 'srpdg':
+            return float(self.config.get('srpdg', {}).get('lambda', 1.0))
+        return 1.0
+
+    def _deep_coral_loss(self, source, target):
+        source = F.adaptive_avg_pool2d(source, output_size=1).flatten(1)
+        target = F.adaptive_avg_pool2d(target, output_size=1).flatten(1)
+        source = source - source.mean(dim=0, keepdim=True)
+        target = target - target.mean(dim=0, keepdim=True)
+        denom = max(source.shape[0] - 1, 1)
+        source_cov = source.t().matmul(source) / denom
+        target_cov = target.t().matmul(target) / denom
+        channels = source.shape[1]
+        return ((source_cov - target_cov) ** 2).sum() / (4.0 * channels * channels)
+
+    def _build_task_loss(self, model_name):
+        if model_name == 'Custom3Tags':
+            return SegMultTaskLoss3Tags()
+        return SegMultTaskLoss()
+
+    def _build_refinement_loss(self, model_name):
+        if model_name == 'Custom3Tags':
+            return RefinementLoss3Tags()
+        return RefinementLoss()
+
+    def _mask_target_for_model(self, masks, mm):
+        if mm.shape[1] == 3:
+            return torch.where(masks == 3, torch.ones_like(masks), masks)
+        return masks
 
     def _get_model(self):
         self.model_name = self.config['run']['model']
@@ -941,6 +1154,8 @@ class RunNetworks():
         distill_cfg = self.config['distill']
         self.teacher_model_name = distill_cfg['teacher_model']
         self.student_model_name = distill_cfg['student_model']
+        if self.teacher_model_name == 'Custom3Tags' or self.student_model_name == 'Custom3Tags':
+            raise RuntimeError("Error: `Custom3Tags` does not support train_distill yet.")
         self.deep_method = distill_cfg.get('deep_method', 'l2').lower()
         if self.deep_method not in ('l2', 'at'):
             raise RuntimeError("Error: distill.deep_method must be `l2` or `at`.")

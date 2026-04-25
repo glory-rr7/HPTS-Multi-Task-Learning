@@ -1,5 +1,5 @@
 from config.config_utils import LoadConfig
-from toJitModels.evalStructureModels import Release,Release_lightly,Release_lightly_extra,Custom
+from models import Release,Release_lightly,Release_lightly_extra,Custom,Custom3Tags
 import torch
 
 # 根据协议加载模型
@@ -15,6 +15,13 @@ elif model == 'Release_lightly_extra':
     model = Release_lightly_extra.ResNet_UNet()
 elif model == 'Custom':
     model = Custom.ResNet_UNet(base =config['custom']['base'],
+                                    refinement =config['custom']['refinement'],
+                                    ffp =config['custom']['ffp'],
+                                    ppm =config['custom']['ppm'],
+                                    down_sample =config['custom']['down_sample'],
+                                    am =config['custom']['am'])
+elif model == 'Custom3Tags':
+    model = Custom3Tags.ResNet_UNet(base =config['custom']['base'],
                                     refinement =config['custom']['refinement'],
                                     ffp =config['custom']['ffp'],
                                     ppm =config['custom']['ppm'],

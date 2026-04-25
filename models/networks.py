@@ -2,11 +2,116 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 def get_pad(in_,  ksize, stride, atrous=1):
     out_ = np.ceil(float(in_)/stride)
     return int(((out_ - 1) * stride + atrous*(ksize-1) + 1 - in_)/2)
+
+
+class BuildOffsetTensor(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, kernel_size=3, dilations=[1]):
+        B, C, H, W = x.shape
+        kh, kw = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+
+        patches_all = []
+        for d in dilations:
+            pad_h = (kh - 1) * d // 2
+            pad_w = (kw - 1) * d // 2
+            x_pad = F.pad(x, (pad_w, pad_w, pad_h, pad_h))
+            p = F.unfold(
+                x_pad,
+                kernel_size=(kh, kw),
+                dilation=(d, d),
+                padding=0,
+                stride=1,
+            )
+            p = p.view(B, C, kh * kw, H, W).permute(0, 1, 3, 4, 2)
+            patches_all.append(p)
+
+        return torch.cat(patches_all, dim=4)
+
+
+class LocalAttention(nn.Module):
+    def __init__(self, in_channels=32, external_out_channels=16,
+                 self_out_channels=16, feature_size=16):
+        super(LocalAttention, self).__init__()
+
+        if external_out_channels == 0 and self_out_channels == 0:
+            raise ValueError("external_out_channels or self_out_channels must be greater than 0")
+
+        self.in_channels = in_channels
+        self.external_out_channels = external_out_channels
+        self.self_out_channels = self_out_channels
+        self.feature_size = feature_size
+        self.out_channels = external_out_channels + self_out_channels
+
+        self.use_external = external_out_channels > 0
+        if self.use_external:
+            self.k = nn.Parameter(torch.Tensor(in_channels, feature_size))
+            self.v = nn.Parameter(torch.Tensor(feature_size, external_out_channels))
+            nn.init.kaiming_uniform_(self.k, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.v, a=math.sqrt(5))
+
+        self.use_self = self_out_channels > 0
+        if self.use_self:
+            self.offset_tensor = BuildOffsetTensor()
+            self.v_project = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=self_out_channels,
+                kernel_size=1,
+            )
+
+    def forward(self, q, k=None):
+        if k is None:
+            k = q
+        outputs = []
+        attn_weight = []
+
+        use_self_attn = (k is not None and q.shape == k.shape and self.use_self)
+        use_external_attn = self.use_external
+
+        if use_external_attn:
+            q_permuted = q.permute(0, 2, 3, 1)
+            attn = torch.matmul(q_permuted, self.k)
+            attn = torch.softmax(attn, dim=-1)
+            out_external = torch.matmul(attn, self.v)
+            out_external = out_external.permute(0, 3, 1, 2)
+            outputs.append(out_external)
+            attn_weight.append(attn.permute(0, 3, 1, 2))
+
+        if use_self_attn:
+            v = self.v_project(k)
+
+            k_shift = self.offset_tensor(k)
+            v_shift = self.offset_tensor(v)
+
+            q_permuted = q.permute(0, 2, 3, 1).unsqueeze(-2)
+            k_shift_permuted = k_shift.permute(0, 2, 3, 1, 4)
+            attn = torch.matmul(q_permuted, k_shift_permuted)
+            attn = torch.softmax(attn, dim=-1)
+
+            v_shift_permuted = v_shift.permute(0, 2, 3, 4, 1)
+            attn_out = torch.matmul(attn, v_shift_permuted)
+            attn_out = attn_out.squeeze(-2).permute(0, 3, 1, 2)
+            outputs.append(attn_out)
+            attn_weight.append(attn.squeeze(-2).permute(0, 3, 1, 2))
+
+        if len(outputs) == 1:
+            outputs = outputs[0]
+            attn_weight = attn_weight[0]
+        else:
+            outputs = torch.cat(outputs, dim=1)
+            attn_weight = torch.cat(attn_weight, dim=1)
+
+        return {
+            "x": outputs,
+            "attn": attn_weight,
+        }
 
 class ConvWithActivation(torch.nn.Module):
     """
@@ -604,4 +709,3 @@ class SE(nn.Module):
 
         return X_input*y.expand_as(X_input)
 #-------------------------------------------------------------------------#
-

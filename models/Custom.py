@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torchvision.models.resnet import Bottleneck,BasicBlock,conv1x1,conv3x3
 from typing import  Type, Union
 from models.networks import ConvWithActivation, Refinement, DoubleConv,Up,PPM,FFP,OutConv,adjust_size
+from models.networks import LocalAttention
 from models.networks import ELA,CoordAtt,CBAM,ECA,SA,SE
 
 # base: 32  # 参数量,默认32，必须是8的倍数，建议8--64，可参考满血版位64，轻量版32
@@ -11,9 +12,14 @@ from models.networks import ELA,CoordAtt,CBAM,ECA,SA,SE
 # ffp: True  # 细化特征模块，与骨干网络并行的网络模块，占用额外显存较大，额外耗时较小
 # ppm: True  # 在最深处使用金字塔池化模块，可以捕捉大范围的图像特征
 # down_sample: 1  # 下采样倍数，默认1表示不进行下采样，建议0.5或者0.75
-# am: ela  # 注意力机制模块，经过实验证明，通道/空间注意力机制模块更好
+# am: ela  # 注意力机制模块，设置为 null/none 时不使用注意力
 
-def get_am( am):
+def get_am(am):
+    if am is None:
+        return None
+    am = str(am).lower()
+    if am in ('null', 'none'):
+        return None
     if am == 'ela':#4,531,596
         return ELA
     elif am == 'ca':#4,535,772
@@ -26,16 +32,31 @@ def get_am( am):
         return SA
     elif am == 'se':#4,532,156
         return SE
+    raise ValueError(f"Unsupported attention module: {am}")
+
 
 class ResNet_UNet(nn.Module):
     def get_name(self):
-        return "Custom"
+        return self.model_name
 
     def return_num(self):
         return 5
 
 
-    def __init__(self, n_channels=3, n_classes=3, base=24, refinement=True, ffp=True, ppm=True, down_sample=1.0, am='ela'):
+    def __init__(
+            self,
+            n_channels=3,
+            n_classes=3,
+            base=24,
+            refinement=True,
+            ffp=True,
+            ppm=True,
+            down_sample=1.0,
+            am='ela',
+            mask_classes=4,
+            model_name="Custom",
+            enable_srpdg_attention=False,
+    ):
         super(ResNet_UNet, self).__init__()
         print("base:", base)
         print("refinement:", refinement)
@@ -43,6 +64,8 @@ class ResNet_UNet(nn.Module):
         print("ppm:", ppm)
         print("down_sample:", down_sample)
         print("am:", am)
+        print("mask_classes:", mask_classes)
+        print("enable_srpdg_attention:", enable_srpdg_attention)
 
         self._norm_layer = nn.BatchNorm2d
         self.inplanes = base//2
@@ -51,6 +74,10 @@ class ResNet_UNet(nn.Module):
         self.groups = 1
         self.n_channels = n_channels
         self.n_classes = n_classes
+        self.mask_classes = mask_classes
+        self.model_name = model_name
+        self.enable_srpdg_attention = enable_srpdg_attention
+        self.strategy_features = {}
         self.block = BasicBlock
         AM = get_am(am)
         self.inc = (DoubleConv(n_channels, self.inplanes))
@@ -58,6 +85,19 @@ class ResNet_UNet(nn.Module):
         self.down2 = self._make_layer(self.block, base*2, 4, stride=2,AM=AM)
         self.down3 = self._make_layer(self.block, base*4, 6, stride=2,AM=AM)
         down4 = self._make_layer(self.block, base*8, 3, stride=2,AM=AM)
+        if enable_srpdg_attention:
+            self.srpdg_attn_down2 = LocalAttention(
+                in_channels=base * 2,
+                self_out_channels=base * 2,
+                external_out_channels=0,
+                feature_size=base,
+            )
+            self.srpdg_attn_down3 = LocalAttention(
+                in_channels=base * 4,
+                self_out_channels=base * 4,
+                external_out_channels=0,
+                feature_size=base * 4,
+            )
 
         if ppm==True:
             self.down4 = nn.Sequential(
@@ -85,7 +125,7 @@ class ResNet_UNet(nn.Module):
         self.xo2 = DoubleConv(base, 3)
         self.mask1 = Up(base*2, base)
         self.mask2 = Up(base, base//2)
-        self.mask3 = nn.Conv2d(base//2, 4,kernel_size=3,padding=1)
+        self.mask3 = nn.Conv2d(base//2, mask_classes,kernel_size=3,padding=1)
 
         if refinement == True:
             self.refinement = Refinement(base)
@@ -94,10 +134,11 @@ class ResNet_UNet(nn.Module):
 
         self.down_sample = down_sample
     def forward(self, x):
+        self.strategy_features = {}
         if self.down_sample != 1:
             x = F.interpolate(x, scale_factor=self.down_sample, mode='bilinear', align_corners=True)
         identity = x
-
+        #print(x.shape)
         shape0 = x.shape
         x1 = self.inc(x)#shape0
         con_x1 = x1
@@ -106,12 +147,18 @@ class ResNet_UNet(nn.Module):
         shape1 = x2.shape
         con_x2 = x2
         x3 = self.down2(x2)#shape2
+        self.strategy_features["down2"] = x3
+        if self.enable_srpdg_attention:
+            self.strategy_features["attn_down2"] = self.srpdg_attn_down2(x3)["attn"]
 
         x4 = self.down3(x3)
+        self.strategy_features["down3"] = x4
+        if self.enable_srpdg_attention:
+            self.strategy_features["attn_down3"] = self.srpdg_attn_down3(x4)["attn"]
 
         x5 = self.down4(x4)
 
-        #print(x4.shape,x5.shape)
+        #print(x5.shape)
         x = self.up1(x5, x4)
         #print(x.shape)
 
@@ -143,6 +190,7 @@ class ResNet_UNet(nn.Module):
         else:
             x = x_o_unet
         if self.down_sample != 1:
+            #print(x.shape)
             factor = 1 / self.down_sample
             xo1 = F.interpolate(xo1, scale_factor=factor, mode='bilinear', align_corners=False)
             xo2 = F.interpolate(xo2, scale_factor=factor, mode='bilinear', align_corners=False)
@@ -191,19 +239,23 @@ class ResNet_UNet(nn.Module):
                 )
             )
 
-        return nn.Sequential(*layers,AM(planes))
+        if AM is not None:
+            layers.append(AM(planes))
+
+        return nn.Sequential(*layers)
 
 
 if __name__ == '__main__':
     import random
 
-    w = 256#int(random.Random().random() * 128)+128
-    h = 256#int(random.Random().random() * 128)+128
+    w = 512#int(random.Random().random() * 128)+128
+    h = 512#int(random.Random().random() * 128)+128
     print(h, w)
-    model = ResNet_UNet(n_channels=3, n_classes=3, base=24,ppm=True,refinement=True,down_sample=1.0,ffp=True,am='ela')
+    model = ResNet_UNet(n_channels=3, n_classes=3, base=24,ppm=True,refinement=True,down_sample=0.6875,ffp=True,am='ela')
     #print(model)
     x = torch.randn(2, 3, h, w)  # Example input
     xo1, xo2, xo3, x, mm = model(x)
+    print(x.shape)
     # print(xo1.shape,xo2.shape,x.shape,mm.shape)  # Should be (1, n_classes, 388, 388)
     # from torchinfo import summary
     # summary(model, input_size=(2, 3, 256, 256),device="cpu")

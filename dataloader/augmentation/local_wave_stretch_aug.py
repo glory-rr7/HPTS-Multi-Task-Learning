@@ -98,9 +98,9 @@ def _apply_remap(image: np.ndarray, map_x: np.ndarray, map_y: np.ndarray, interp
 
 def apply_local_wave_stretch(
     data: Dict[str, torch.Tensor],
-    num_waves_range=(1, 3),
-    amp_y_range=(3.0, 5.0),
-    amp_x_range=(0.4, 2.0),
+    num_waves_range=(2, 4),
+    amp_y_range=(7.0, 11.0),
+    amp_x_range=(1.2, 4.0),
     window_ratio_range=(0.12, 0.70),
 ) -> Dict[str, torch.Tensor]:
     """
