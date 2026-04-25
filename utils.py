@@ -5,6 +5,16 @@ from torchvision.utils import save_image
 import numpy as np
 import random
 
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
+
+def _denormalize_imagenet_rgb_tensor(tensor):
+    mean = IMAGENET_MEAN.to(device=tensor.device, dtype=tensor.dtype)
+    std = IMAGENET_STD.to(device=tensor.device, dtype=tensor.dtype)
+    return tensor * std + mean
+
+
 def maskToTensor(mask,device):
     # Define the color-to-label and label-to-color mappings
     color_to_label = {
@@ -87,7 +97,7 @@ def sample_images(valdataset, model, save_dir):
     save_image(large_image, save_dir, nrow=1, normalize=True)
     print(f"Image saved to {save_dir}")
 
-def save_tensor_as_image(tensor, filename):
+def save_tensor_as_image(tensor, filename, imagenet_denorm=True):
     """将PyTorch张量保存为图像文件
 
     参数：
@@ -97,10 +107,13 @@ def save_tensor_as_image(tensor, filename):
             - (1, C, H, W)   带批次维度的彩色图
             - (B, C, H, W)   仅当B=1时支持
         filename (str): 输出文件名（需包含扩展名）
+        imagenet_denorm (bool): 对 3 通道 float 张量是否先按 ImageNet
+            mean/std 做反归一化。默认 True，适合保存 dataloader/model 中
+            已归一化的 RGB 图像；mask 等非归一化张量请传 False。
 
     支持数据类型：
         - torch.uint8       直接保存
-        - torch.float       自动归一化（假设输入范围0-1）
+        - torch.float       3 通道默认先按 ImageNet 反归一化，再裁剪到 [0,1]
     """
     # 移除梯度追踪并转CPU
     tensor = tensor.detach().cpu()
@@ -111,6 +124,16 @@ def save_tensor_as_image(tensor, filename):
             raise ValueError("only save single image file")
         tensor = tensor.squeeze(0)
 
+    # 处理数据类型
+    if tensor.is_floating_point():
+        if tensor.dim() == 3 and tensor.shape[0] == 3 and imagenet_denorm:
+            tensor = _denormalize_imagenet_rgb_tensor(tensor)
+        tensor = torch.clamp(tensor, 0.0, 1.0)
+    elif tensor.dtype == torch.uint8:
+        pass
+    else:
+        raise TypeError(f"error type: {tensor.dtype}")
+
     # 处理通道维度 (C, H, W) -> (H, W, C)
     if tensor.dim() == 3:
         tensor = tensor.permute(1, 2, 0)
@@ -118,14 +141,8 @@ def save_tensor_as_image(tensor, filename):
     # 转换为numpy数组
     arr = tensor.numpy()
 
-    # 处理数据类型
-    if arr.dtype in [np.float32, np.float64]:
-        arr = np.clip(arr, 0, 1)  # 确保数值范围正确
-        arr = (arr * 255).astype(np.uint8)
-    elif arr.dtype == np.uint8:
-        pass  # 保持原样
-    else:
-        raise TypeError(f"error type: {arr.dtype}")
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = (arr * 255.0).round().astype(np.uint8)
 
     # 处理单通道维度
     if arr.ndim == 3 and arr.shape[-1] == 1:
