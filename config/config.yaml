@@ -2,32 +2,31 @@ run:  # 程序运行通用配置
 
   # 四种模式  训练：train    蒸馏训练：train_distill    测试评估：evaluate    单张图像擦除：predict
   type: predict
-
   # random seed
   seed: 1  #False 或者 数字，通常来说不使用种子会训练得更快；实验的时候推荐使用一个固定的种子
 
-  # 自定义参数：Custom    满血版：Release    轻量化版：Release_lightly     极轻量化版：Release_lightly_extra
+  # 自定义参数：Custom / Custom3Tags    满血版：Release    轻量化版：Release_lightly     极轻量化版：Release_lightly_extra
   # QAT: Release_quantized
-  model: 'Release_quantized'
+  model: 'Custom'
   # to save models, logs and samples
   data_path: './data'
 
   # 是否将图像裁剪成小块
   data_crop:
-    use: True
+    use: False
     size: 512  # 128的整数倍
 
 
 custom:  # 使用custom自定义模型的相关参数
 
-  base: 32 #32    # 参数量,默认32，必须是8的倍数，建议16,24,32,40,48,56,64，可参考满血版位64，轻量版32
+  base: 40 #32    # 参数量,默认32，必须是8的倍数，建议16,24,32,40,48,56,64，可参考满血版位64，轻量版32
   refinement: False #True   # 精修复模块，与骨干网络串行的网络模块，占用额外显存较小，但会增加耗时
-  ffp: True #True   # 细化特征模块，与骨干网络并行的网络模块，占用额外显存较大，额外耗时较小
-  ppm: True #True   # 在最深处使用金字塔池化模块，可以捕捉大范围的图像特征
-  down_sample: 1.0  # 下采样倍数，默认1表示不进行下采样，建议0.5或者0.75
+  ffp: False #True   # 细化特征模块，与骨干网络并行的网络模块，占用额外显存较大，额外耗时较小
+  ppm: False #True   # 在最深处使用金字塔池化模块，可以捕捉大范围的图像特征
+  down_sample: 0.5  # 下采样倍数，默认1表示不进行下采样，建议0.5或者0.75
 
-  # 注意力机制包含 ca,cbam,ela,eca,se,sa
-  am: ela # 注意力机制模块，经过实验证明，通道/空间注意力机制模块更好,因此不提供self-attn和non-local
+  # 注意力机制包含 ca,cbam,ela,eca,se,sa,null
+  am: ela # 注意力机制模块；设为 null 时下采样部分不嵌入注意力机制
 
 
 distill:  # 仅 run.type=train_distill 时生效
@@ -75,59 +74,51 @@ distill:  # 仅 run.type=train_distill 时生效
   adapter:
     teacher_conv1x1:
       trainable: True
-      # 显式恢复 teacher 1x1 adapter 权重（优先级高于 student_pretrained 自动同名加载）
-      resume:
-        use: False
-        path: './data/train_distill/your_run_id/models/20_adapter.pth'
-      # 兼容旧写法（可选）：resume_path: './data/train_distill/your_run_id/models/20_adapter.pth'
+
+srpdg:
+  lambda: 50.0  # SRPDG attention consistency loss 权重；主项目任务损失较大，需要放大该正则项
 
 train:
-  aug: False  # 数据增强开关：在 dataset 中以 60% 概率触发一次增强，并在5种方法中等概率选择1种；不再使用旧的 crop/scale 增强
+  aug: True  # 数据增强开关：在 dataset 中以 60% 概率触发一次增强，并在5种方法中等概率选择1种；不再使用旧的 crop/scale 增强
+  strategy: none  # 训练策略：none / srpdg / coral；启用策略时由训练循环接管成对增强
 
   pretrained:  # 使用预训练模型
     use: True
 #    model_path: './data/train/Release_threetags_20250719_v0/models/200.pth'
-    model_path: "./data/train/Release_mixed98_20250909_v0/models/60.pth"
+    model_path: "/home/luzhixian/HTR_Release_2_DL/data/train/Pretrained40/models/100.pth"
 
-  epochs: 10  #训练批次
-  model_save_every: 2  # 模型保存间隔，做实验的时候间隔调适中，方便断点继续训练；应用场景下，间隔调小一点，精确使用效果最好的模型
+  epochs: 200  #训练批次
+  model_save_every: 5  # 模型保存间隔，做实验的时候间隔调适中，方便断点继续训练；应用场景下，间隔调小一点，精确使用效果最好的模型
   sample_save_every: 1  # 样本保存间隔，默认1就行
-  learning_rate: 0.0002 # 学习率,别调太大，通常小于0.001
-  lr_schedule:          # 按 epoch 动态调整学习率（同时作用于 train / train_distill）
-    use: False
-    steps:
-      - epoch: 20
-        lr: 0.0001
-      - epoch: 40
-        lr: 0.00005
-  batch_size: 4       # 批次大小，因为有用到batch normal，所以建议不要把batch size设置成1，会报错
-  numberworks: 8        # 线程数，需要预处理的图像可能会比较耗时，线程数可以开大点，单张显卡对应4-8个线程是符合经验的选择
-  # 支持单路径字符串，或标准 YAML 列表（推荐）
+  learning_rate: 0.00002 # 学习率,别调太大，通常小于0.001
+  batch_size: 24       # 批次大小，因为有用到batch normal，所以建议不要把batch size设置成1，会报错
+  numberworks: 12        # 线程数，需要预处理的图像可能会比较耗时，线程数可以开大点，单张显卡对应4-8个线程是符合经验的选择
   dataset_path:
-    - './datasets/mixed_25.9.8/train'
-    # - './datasets/another_dataset/train'
+    #- '/home/luzhixian/bak/datasets/truedata/train'
+    #    - '/home/luzhixian/bak/datasets/synth_data2'
+#    - '/home/luzhixian/bak/datasets/coarse'
+# - '/home/luzhixian/bak/datasets/synth_data'
+     - '/home/luzhixian/bak/datasets/v2.2-REAL/train'
+#    - '/home/luzhixian/bak/datasets/threetags/direct'
+#    - '/home/luzhixian/bak/datasets/threetags/baidu/baidu'
   #path: "./dataset/threetags"
 
   mult_stage_loss:      # 多阶段损失，开启多阶段损失后，会在设定批次之后开始专注于输出模块的性能，忽略过程中其他模块的性能
-    use: True         # 是否使用多阶段损失，做实验的时候推荐不要用，微调模型的时候可以用
+    use: False         # 是否使用多阶段损失，做实验的时候推荐不要用，微调模型的时候可以用
     epoch: 2            # 多阶段损失开始训练的批次
 
 validation:             # 验证集配置，训练的每一个批次训练完成之后，会验证一次模型，也就是在模型没有见过的模型上简单测试一下性能
-  dataset_path:
-    - './datasets/mixed_25.9.8/val'
-    # - './datasets/another_dataset/val'
-  batch_size: 4
+  dataset_path: '/home/luzhixian/bak/datasets/v2.2-REAL/val'
+  batch_size: 8
   numberworks: 4
 
 predict:                # 单张擦除图像
   # model_path: '../HTR_Release/data/train/Release_mixed98_20250909_v0/models/60.pth'
-  model_path: "../HTR_Release_2_DL/data/train/Release_QAT_mixed98_20251018_v0/models/8.pth"
-  input_file_path: "../HTR_Release_2_DL/datasets/mixed_25.9.8/test/images/89.jpg"
+  model_path: "./checkpoints/finetune_40.pth"
+  input_file_path: "checkpoints/cis_bmp_20250606_122008.png" #"./datasets/HTR-test/HTR-A001-20260114-uncer-incomplete/bszn/3/base.jpg"
 
 evaluate:               # 测试评估，评估模型性能，只有批次为1的时候可以计算ssim，否则只能计算psnr
   model_path: './data/train/Release_threetags_20250719_v0/models/200.pth'
   batch_size: 1
   numberworks: 1
-  dataset_path:
-    - './datasets/truedata/test'
-    # - './datasets/another_dataset/test'
+  dataset_path: './datasets/truedata/test'
