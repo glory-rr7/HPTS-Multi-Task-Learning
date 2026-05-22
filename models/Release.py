@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torchvision.models.resnet import Bottleneck,BasicBlock,conv1x1,conv3x3
 from typing import  Type, Union
 from models.networks import ConvWithActivation, get_pad, DeConvWithActivation,DoubleConv,Up,PPM,FFP,OutConv,adjust_size, ELA
+from models.model_output import make_model_output
 
 
 
@@ -161,7 +162,7 @@ class ResNet_UNet(nn.Module):
         x = self.coarse_deconvb(torch.cat([x, x_c1, temp], dim=1))
         x = self.coarse_convn(x)  # shape0
         [x] = adjust_size([x], shape0[2] * 2, shape0[3] * 2)
-        return xo1, xo2, x_o_unet, x, mm
+        return make_model_output(x1=xo1, x2=xo2, x3=x_o_unet, output=x, mask_logits=mm)
 
     def _make_layer(
             self,
@@ -291,4 +292,3 @@ if __name__ == '__main__':
     # 可视化并保存批次中的第一张图像
     output_image_path = "../output_image5.png"  # 指定保存路径
     visualize_and_save_rgb_image(output_image, save_path=output_image_path)
-

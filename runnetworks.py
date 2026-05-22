@@ -28,20 +28,15 @@ from loss.Loss import (
     deep_feature_l2_loss,
     deep_feature_at_loss,
 )
-from models import Release,Release_lightly, Release_lightly_extra, Custom, Custom3Tags
+from models import Release, Release_lightly, Release_lightly_extra, Custom, Custom3Tags
+from models import ResNet, IEResNet, IEXResNet
+from models.model_output import ensure_model_output
 from utils import sample_images, save_tensor_as_image, split_image, ImageBlocks ,get_transformer,maskToTensor
 from dataloader.seg_datasets import SegImageDataset
 from dataloader.block_seg_datasets import BlockSegImageDataset
-from dataloader.augmentation.local_wave_stretch_aug import apply_local_wave_stretch
-from dataloader.augmentation.overexposure_image_aug import apply_overexposure_image
-from dataloader.augmentation.edge_artifact_image_aug import apply_edge_artifact_image
-from dataloader.augmentation.bond_color_shift_aug import apply_bond_color_shift
+from dataloader.augmentation import STRATEGY_AUG_PROB
 from config.config_utils import LoadConfig
 
-
-STRATEGY_AUG_PROB = 0.6
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 
@@ -91,7 +86,23 @@ class RunNetworks():
         # 该次运行的根路径，用于存储相关文件
         self.data_root_path = os.path.join(self.config['run']['data_path'],self.worktype, self.run_id)
 
-        self.train_logs_fields = ['epoch', 'loss','L1','MSE','PSNR','ValidationMSE','ValidationPSNR']
+        self.train_logs_fields = [
+            'epoch',
+            'loss',
+            'TaskLoss',
+            'StrategyLoss',
+            'WeightedStrategyLoss',
+            'MSRLoss',
+            'RefinementLoss',
+            'MaskLoss',
+            'L1',
+            'MSE',
+            'PSNR',
+            'ValidationMSE',
+            'ValidationPSNR',
+            'TrainInferenceTime',
+            'ValidationInferenceTime',
+        ]
         self.distill_logs_fields = [
             'epoch',
             'loss_total',
@@ -104,6 +115,8 @@ class RunNetworks():
             'PSNR',
             'ValidationMSE',
             'ValidationPSNR',
+            'TrainInferenceTime',
+            'ValidationInferenceTime',
         ]
 
         self.evaluate_logs_fields = ['idx', 'loss', 'L1','MSE','PSNR','SSIM','total_loss', 'total_L1','total_MSE','total_PSNR','total_SSIM','file_num']
@@ -159,7 +172,7 @@ class RunNetworks():
         # 如果需要使用预训练的模型，则加载预训练的模型
         if train_cfg['pretrained']['use']:
             model_path = train_cfg['pretrained']['model_path']
-            self.model.load_state_dict(torch.load(model_path), strict=False)
+            self._load_checkpoint_flexible(self.model, model_path, name="train.pretrained")
 
         # Loss
         # 创建损失函数
@@ -171,6 +184,12 @@ class RunNetworks():
         # 如果输入的图片尺寸大小一致，可以选择性使用裁剪
 
         dataset_use_aug = train_cfg['aug'] if train_strategy == 'none' else False
+        dataset_use_strategy = train_strategy != 'none'
+        train_loader_kwargs = self._build_loader_kwargs(
+            num_workers=train_cfg['numberworks'],
+            pin_memory=True,
+            prefetch_factor=train_cfg.get('prefetch_factor'),
+        )
 
         if self.config['run']['data_crop']['use'] :
 
@@ -180,11 +199,12 @@ class RunNetworks():
                     mode="train",
                     tile_size=self.config['run']['data_crop'] ['size'],
                     use_aug=dataset_use_aug,
+                    use_strategy=dataset_use_strategy,
                 ),
                 batch_size=train_cfg['batch_size'],
                 shuffle=True,
                 drop_last=True,
-                num_workers=train_cfg['numberworks'])
+                **train_loader_kwargs)
 
             valdataset=BlockSegImageDataset(
                 root=val_roots,
@@ -196,7 +216,8 @@ class RunNetworks():
                 valdataset,
                 batch_size=self.config['validation']['batch_size'],
                 shuffle=True,
-                num_workers=self.config['validation']['numberworks'])
+                num_workers=self.config['validation']['numberworks'],
+                pin_memory=True)
 
         else:
             traindataset = DataLoader(
@@ -204,12 +225,12 @@ class RunNetworks():
                     root=train_roots,
                     mode="train",
                     use_aug=dataset_use_aug,
+                    use_strategy=dataset_use_strategy,
                 ),
                 batch_size=train_cfg['batch_size'],
                 drop_last=True,
                 shuffle=True,
-                num_workers=train_cfg['numberworks'],
-                pin_memory=True)
+                **train_loader_kwargs)
             valdataset=SegImageDataset(
                 root=val_roots,
                 mode="validation",
@@ -239,85 +260,91 @@ class RunNetworks():
         sample_images(valdataset, self.model, os.path.join(save_samples_dir, str(0) + '.png'))
         torch.save(self.model.state_dict(), os.path.join(save_models_dir, str(0) + '.pth'))
 
-
-        REFINEMENT = False
         #训练
         for epochs in range(1, train_cfg['epochs'] + 1):
             self._apply_lr_schedule(G_optimizer, epochs, lr_schedule_map)
             if epochs ==  train_cfg['mult_stage_loss']['epoch'] and train_cfg['mult_stage_loss']['use']:
                 criterion = self._build_refinement_loss(self.model_name).to(self.device)
                 print("change loss")
-                REFINEMENT = True
             torch.cuda.empty_cache()
             epoch_loss = 0
+            epoch_task_loss = 0
+            epoch_strategy_loss = 0
+            epoch_weighted_strategy_loss = 0
+            epoch_msr_loss = 0
+            epoch_refinement_loss = 0
+            epoch_mask_loss = 0
             epoch_L1_loss = 0
             epoch_mse_loss = 0
             epoch_psnr = 0
+            epoch_inference_time = 0.0
             # 将模型切换到训练模式
             self.model.train()
-            for idx, (imgs, gt, masks) in enumerate(traindataset):
-                # Loading image, ground truth and mask
-                # 从训练集中加载图像、标签和掩码
-                imgs = imgs.to(self.device)
-                gt = gt.to(self.device)
-                masks = masks.to(self.device)
+            for idx, batch in enumerate(traindataset):
+                if train_strategy == 'none':
+                    imgs, gt, masks = batch
+                    # Loading image, ground truth and mask
+                    # 从训练集中加载图像、标签和掩码
+                    imgs = imgs.to(self.device)
+                    gt = gt.to(self.device)
+                    masks = masks.to(self.device)
+                else:
+                    # Dataset 已在 worker 中生成两个视角，直接解包
+                    ori_imgs, ori_gt, ori_masks, aug_imgs, aug_gt, aug_masks = batch
+                    pair_imgs  = torch.cat([ori_imgs,  aug_imgs],  dim=0).to(self.device)
+                    pair_gt    = torch.cat([ori_gt,    aug_gt],    dim=0).to(self.device)
+                    pair_masks = torch.cat([ori_masks, aug_masks], dim=0).to(self.device)
 
                 self.model.zero_grad()
 
                 if train_strategy == 'none':
                     # Get output from forward and calculate loss to train model
                     # 获取输出并计算损失以训练模型
-                    if (self.model.return_num()) == 4:
-                        x_o1, x_o2, x_o3, mm = self.model(imgs)
-                        fake_images = x_o3
-                    else:
-                        x_o1, x_o2, x_o3, fake_images, mm = self.model(imgs)
+                    infer_start = self._start_inference_timer()
+                    outputs = self._forward_model(self.model, imgs)
+                    epoch_inference_time += self._stop_inference_timer(infer_start)
 
-                    if REFINEMENT:
-                        G_loss = criterion(masks,fake_images,gt)
-                    else:
-                        G_loss = criterion(masks, x_o1, x_o2, x_o3, fake_images, mm, gt, idx)
                     task_masks = masks
                     task_gt = gt
+                    task_batch = self._make_task_batch(task_masks, task_gt)
+                    task_loss_dict = criterion(task_batch, outputs)
+                    task_loss = task_loss_dict["total"]
+                    strategy_loss = torch.tensor(0.0, device=self.device)
+                    weighted_strategy_loss = torch.tensor(0.0, device=self.device)
+                    G_loss = task_loss
                 else:
-                    pair_imgs, pair_gt, pair_masks = self._build_strategy_pair_batch(imgs, gt, masks)
-                    if (self.model.return_num()) == 4:
-                        pair_x_o1, pair_x_o2, pair_x_o3, pair_mm = self.model(pair_imgs)
-                        pair_fake_images = pair_x_o3
+                    select_idx = self._sample_strategy_supervision_indices(ori_imgs.shape[0], pair_imgs.device)
+                    infer_start = self._start_inference_timer()
+                    if hasattr(self.model, 'forward_strategy'):
+                        pair_outputs = ensure_model_output(self.model.forward_strategy(pair_imgs, select_idx))
+                        outputs = pair_outputs
                     else:
-                        pair_x_o1, pair_x_o2, pair_x_o3, pair_fake_images, pair_mm = self.model(pair_imgs)
-
-                    select_idx = self._sample_strategy_supervision_indices(imgs.shape[0], imgs.device)
-                    x_o1 = self._select_batch(pair_x_o1, select_idx)
-                    x_o2 = self._select_batch(pair_x_o2, select_idx)
-                    x_o3 = self._select_batch(pair_x_o3, select_idx)
-                    fake_images = self._select_batch(pair_fake_images, select_idx)
-                    mm = self._select_batch(pair_mm, select_idx)
+                        pair_outputs = self._forward_model(self.model, pair_imgs)
+                        outputs = self._select_model_output(pair_outputs, select_idx)
+                    epoch_inference_time += self._stop_inference_timer(infer_start)
                     task_masks = self._select_batch(pair_masks, select_idx)
                     task_gt = self._select_batch(pair_gt, select_idx)
 
-                    if REFINEMENT:
-                        task_loss = criterion(task_masks, fake_images, task_gt)
-                    else:
-                        task_loss = criterion(task_masks, x_o1, x_o2, x_o3, fake_images, mm, task_gt, idx)
-                    strategy_loss = self._compute_strategy_loss(train_strategy, imgs.shape[0])
-                    G_loss = task_loss + strategy_loss_weight * strategy_loss
+                    task_batch = self._make_task_batch(task_masks, task_gt)
+                    task_loss_dict = criterion(task_batch, outputs)
+                    task_loss = task_loss_dict["total"]
+                    strategy_loss = self._compute_strategy_loss(train_strategy, ori_imgs.shape[0], pair_outputs)
+                    weighted_strategy_loss = strategy_loss_weight * strategy_loss
+                    G_loss = task_loss + weighted_strategy_loss
 
-                target = self._mask_target_for_model(task_masks, mm).squeeze(1)
-                u = torch.unique(target)
-
-                #print("mm.shape:", mm.shape, "target dtype:", target.dtype, "target unique:", u[:20])
-
-                if target.min() < 0 or target.max() >= mm.shape[1]:
-                    raise RuntimeError(
-                        f"target out of range: min={target.min().item()}, max={target.max().item()}, "
-                        f"num_classes={mm.shape[1]}, unique={u.tolist()[:50]}"
-                    )
+                fake_images = outputs["output"]
+                mm = outputs["mask_logits"]
                 G_loss = G_loss.sum()
                 G_optimizer.zero_grad()
                 G_loss.backward()
                 G_optimizer.step()
                 epoch_loss += G_loss.item()
+                epoch_task_loss += task_loss.item()
+                epoch_strategy_loss += strategy_loss.item()
+                epoch_weighted_strategy_loss += weighted_strategy_loss.item()
+                epoch_msr_loss += self._loss_item(task_loss_dict, "multiscale")
+                epoch_refinement_loss += self._loss_item(task_loss_dict, "refinement")
+                epoch_mask_loss += self._loss_item(task_loss_dict, "mask")
                 # print('[{}/{}] Generator Loss of epoch{} is {}'.format(k, len(dataloader), i, G_loss.item()))
 
                 with torch.no_grad():
@@ -354,6 +381,12 @@ class RunNetworks():
                     f"\rEpoch: [{epochs}/{train_cfg['epochs']}] "
                     f"Batch: [{idx + 1}/{len(traindataset)}] "
                     f"Epoch Avg Loss: {epoch_loss / (idx + 1):.4f} "
+                    f"Task: {epoch_task_loss / (idx + 1):.4f} "
+                    f"Strategy: {epoch_strategy_loss / (idx + 1):.4f} "
+                    f"WStrategy: {epoch_weighted_strategy_loss / (idx + 1):.4f} "
+                    f"MSR: {epoch_msr_loss / (idx + 1):.4f} "
+                    f"Refine: {epoch_refinement_loss / (idx + 1):.4f} "
+                    f"Mask: {epoch_mask_loss / (idx + 1):.4f} "
                     f"L1 Loss: {epoch_L1_loss / (idx + 1):.4f} "
                     f"MSE Loss: {epoch_mse_loss / (idx + 1):.4f} "
                     f"PSNR: {epoch_psnr / (idx + 1):.4f} "
@@ -367,7 +400,7 @@ class RunNetworks():
 
 
             val_start = time.time()
-            val_mse, val_psnr = self.test_epoch(valdataloader)
+            val_mse, val_psnr, val_inference_time = self.test_epoch(valdataloader)
             val_cost = time.time() - val_start  # 整个验证耗时
             recent_times.append(val_cost)
             pre_time = time.time()  # 下一 epoch 计时基点
@@ -379,11 +412,19 @@ class RunNetworks():
                 writer.writerow({
                             'epoch': epochs,
                             'loss': epoch_loss / (len(traindataset)),
+                            'TaskLoss': epoch_task_loss / (len(traindataset)),
+                            'StrategyLoss': epoch_strategy_loss / (len(traindataset)),
+                            'WeightedStrategyLoss': epoch_weighted_strategy_loss / (len(traindataset)),
+                            'MSRLoss': epoch_msr_loss / (len(traindataset)),
+                            'RefinementLoss': epoch_refinement_loss / (len(traindataset)),
+                            'MaskLoss': epoch_mask_loss / (len(traindataset)),
                             'L1': epoch_L1_loss / (len(traindataset)),
                             'MSE': epoch_mse_loss / (len(traindataset)),
                             'PSNR': epoch_psnr / (len(traindataset)),
                             'ValidationMSE': val_mse,
                             'ValidationPSNR': val_psnr,
+                            'TrainInferenceTime': epoch_inference_time,
+                            'ValidationInferenceTime': val_inference_time,
                         })
 
             # Save sample images
@@ -415,7 +456,7 @@ class RunNetworks():
         save_logs_path = os.path.join(str(self.data_root_path), str('logs.csv'))
         self._init_data_path([save_models_dir, save_samples_dir], save_logs_path)
 
-        criterion_task = SegMultTaskLoss().to(self.device)
+        criterion_task = self._build_task_loss(self.student_model_name).to(self.device)
         criterion_distill = DistillationLoss().to(self.device)
 
         if self.config['run']['data_crop']['use']:
@@ -500,6 +541,7 @@ class RunNetworks():
             epoch_L1_loss = 0.0
             epoch_mse_loss = 0.0
             epoch_psnr = 0.0
+            epoch_inference_time = 0.0
 
             self.teacher_model.eval()
             self.student_model.train()
@@ -515,28 +557,23 @@ class RunNetworks():
                 self.student_deep_feature = None
 
                 with torch.no_grad():
-                    if self.teacher_model.return_num() == 4:
-                        _, _, teacher_output, teacher_mm = self.teacher_model(imgs)
-                    else:
-                        _, _, _, teacher_output, teacher_mm = self.teacher_model(imgs)
+                    infer_start = self._start_inference_timer()
+                    teacher_outputs = self._forward_model(self.teacher_model, imgs)
+                    epoch_inference_time += self._stop_inference_timer(infer_start)
 
-                if self.student_model.return_num() == 4:
-                    s_xo1, s_xo2, s_xo3, student_mm = self.student_model(imgs)
-                    student_output = s_xo3
-                else:
-                    s_xo1, s_xo2, s_xo3, student_output, student_mm = self.student_model(imgs)
+                infer_start = self._start_inference_timer()
+                student_outputs = self._forward_model(self.student_model, imgs)
+                epoch_inference_time += self._stop_inference_timer(infer_start)
+                student_output = student_outputs["output"]
 
                 if self.teacher_deep_feature is None or self.student_deep_feature is None:
                     raise RuntimeError("Error: Deep feature hook failed to capture outputs.")
 
-                task_loss = criterion_task(masks, s_xo1, s_xo2, s_xo3, student_output, student_mm, gt, idx)
-                task_loss = task_loss.sum()
-                output_loss, mm_loss = criterion_distill(
-                    student_output=student_output,
-                    student_mm=student_mm,
-                    teacher_output=teacher_output,
-                    teacher_mm=teacher_mm
-                )
+                task_loss_dict = criterion_task(self._make_task_batch(masks, gt), student_outputs)
+                task_loss = task_loss_dict["total"]
+                distill_loss_dict = criterion_distill(student_outputs, teacher_outputs)
+                output_loss = distill_loss_dict["output"]
+                mm_loss = distill_loss_dict["mask"]
                 deep_loss = self._compute_deep_loss(
                     student_deep=self.student_deep_feature,
                     teacher_deep=self.teacher_deep_feature,
@@ -599,7 +636,7 @@ class RunNetworks():
 
             self.model = self.student_model
             val_start = time.time()
-            val_mse, val_psnr = self.test_epoch(valdataloader)
+            val_mse, val_psnr, val_inference_time = self.test_epoch(valdataloader)
             val_cost = time.time() - val_start
             recent_times.append(val_cost)
             pre_time = time.time()
@@ -618,6 +655,8 @@ class RunNetworks():
                     'PSNR': epoch_psnr / len(traindataset),
                     'ValidationMSE': val_mse,
                     'ValidationPSNR': val_psnr,
+                    'TrainInferenceTime': epoch_inference_time,
+                    'ValidationInferenceTime': val_inference_time,
                 })
 
             if (epochs % train_cfg['sample_save_every'] == 0):
@@ -651,6 +690,7 @@ class RunNetworks():
         epoch_L1_loss = 0.0
         epoch_mse_loss = 0.0
         epoch_psnr = 0.0
+        epoch_inference_time = 0.0
 
         for idx, (imgs, gt, masks) in enumerate(testloader):
             # ---------------- 数据搬运 ----------------
@@ -659,10 +699,10 @@ class RunNetworks():
             masks = masks.to(self.device)
 
             # ---------------- 前向推理 ----------------
-            if self.model.return_num() == 4:
-                _, _, fake_images, _ = self.model(imgs)  # x_o3 作为输出
-            else:
-                _, _, _, fake_images, _ = self.model(imgs)
+            infer_start = self._start_inference_timer()
+            outputs = self._forward_model(self.model, imgs)
+            epoch_inference_time += self._stop_inference_timer(infer_start)
+            fake_images = outputs["output"]
 
             # ---------------- 计算指标 ----------------
             L1_loss, mse_loss, psnr = SimilarityLoss(fake_images, gt, SSIM=False)
@@ -697,7 +737,7 @@ class RunNetworks():
         # 换行，避免覆盖下一条输出
         print()
 
-        return epoch_mse_loss / len(testloader), epoch_psnr / len(testloader)
+        return epoch_mse_loss / len(testloader), epoch_psnr / len(testloader), epoch_inference_time
 
     def evaluate(self):
 
@@ -717,7 +757,7 @@ class RunNetworks():
 
         # Use pretrained model
         model_path = self.config['evaluate']['model_path']
-        self.model.load_state_dict(torch.load(model_path), strict=False)
+        self._load_checkpoint_flexible(self.model, model_path, name="evaluate.model")
 
         # Loss
         # 创建损失函数
@@ -773,12 +813,10 @@ class RunNetworks():
             masks = masks.to(self.device)
 
             with torch.no_grad():
-                if self.model.return_num() == 4:
-                    x_o1, x_o2, x_o3, mm = self.model(imgs)
-                    fake_images = x_o3  # 为了保持和HTRNet的输出一致
-                else:
-                    x_o1, x_o2, x_o3, fake_images, mm = self.model(imgs)
-                G_loss = criterion(masks, x_o1, x_o2, x_o3, fake_images, mm, gt, idx)
+                outputs = self._forward_model(self.model, imgs)
+                fake_images = outputs["output"]
+                loss_dict = criterion(self._make_task_batch(masks, gt), outputs)
+                G_loss = loss_dict["total"]
                 epoch_loss += G_loss.item()
                 L1_loss, mse_loss, psnr, ssim = SimilarityLoss(fake_images, gt)
                 L1_loss = L1_loss.item()
@@ -859,8 +897,7 @@ class RunNetworks():
         # Load model
         # 加载模型
         model_path = self.config['predict']['model_path']
-        state_dict = torch.load(model_path, map_location=torch.device(self.device))
-        self.model.load_state_dict(state_dict, strict=False)
+        self._load_checkpoint_flexible(self.model, model_path, name="predict.model")
 
         # Load image
         # 加载图片
@@ -886,11 +923,12 @@ class RunNetworks():
                     tile = image.crop((left, top, right + 1, bottom + 1))
                     tile_tensor = transform(tile).unsqueeze(0).to(self.device)
 
-                    if self.model.return_num()==4:
-                        x1_b, x2_b, x3_b, mask_b = self.model(tile_tensor)
-                        output_b = x3_b
-                    elif self.model.return_num()==5:
-                        x1_b, x2_b, x3_b, output_b, mask_b = self.model(tile_tensor)
+                    outputs_b = self._forward_model(self.model, tile_tensor)
+                    x1_b = outputs_b["x1"]
+                    x2_b = outputs_b["x2"]
+                    x3_b = outputs_b["x3"]
+                    output_b = outputs_b["output"]
+                    mask_b = outputs_b["mask_logits"]
 
                     # 将当前块的预测结果加入类中
                     x1.add_block([element // 4 for element in pos], x1_b)
@@ -913,7 +951,12 @@ class RunNetworks():
             print(image.size)
             # predict
             with torch.no_grad():
-                x1, x2, x3, output, mask = self.model(image_tensor)
+                outputs = self._forward_model(self.model, image_tensor)
+                x1 = outputs["x1"]
+                x2 = outputs["x2"]
+                x3 = outputs["x3"]
+                output = outputs["output"]
+                mask = outputs["mask_logits"]
             print(x1.shape, x2.shape, x3.shape, output.shape, mask.shape)
             mask = torch.argmax(mask, 1).unsqueeze(0)
             mask = maskToTensor(mask, self.device)
@@ -955,6 +998,12 @@ class RunNetworks():
                 am=cfg['am'],
                 enable_srpdg_attention=self._get_train_strategy() == 'srpdg',
             ).to(self.device)
+        if model_name == 'ResNet':
+            return ResNet.ResNet_UNet().to(self.device)
+        if model_name == 'IEResNet':
+            return IEResNet.ResNet_UNet().to(self.device)
+        if model_name == 'IEXResNet':
+            return IEXResNet.ResNet_UNet().to(self.device)
         raise RuntimeError(f"Error: Model `{model_name}` is not exist!")
 
     def _get_train_strategy(self):
@@ -976,84 +1025,10 @@ class RunNetworks():
         if strategy in ('srpdg', 'coral') and self.model_name not in ('Custom', 'Custom3Tags'):
             raise RuntimeError(f"Error: train.strategy `{strategy}` only supports Custom and Custom3Tags.")
 
-    def _denormalize_for_aug(self, tensor):
-        mean = torch.as_tensor(IMAGENET_MEAN, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
-        std = torch.as_tensor(IMAGENET_STD, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
-        tensor = (tensor * std + mean).clamp(0.0, 1.0)
-        return torch.clamp(torch.round(tensor * 255.0), 0, 255).to(torch.uint8)
-
-    def _normalize_after_aug(self, tensor):
-        tensor = tensor.float() / 255.0
-        mean = torch.as_tensor(IMAGENET_MEAN, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
-        std = torch.as_tensor(IMAGENET_STD, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
-        return (tensor - mean) / std
-
-    def _apply_shared_pair_augment(self, image, rebuild, mask):
-        data = {
-            "image": image,
-            "rebuild": rebuild,
-            "mask": mask.to(dtype=torch.uint8),
-        }
-        r = random.random()
-        if r < 0.2:
-            dims = [2]
-            data = {k: torch.flip(v, dims=dims) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
-        elif r < 0.4:
-            dims = [1]
-            data = {k: torch.flip(v, dims=dims) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
-        elif r < 0.6:
-            data = {k: torch.rot90(v, k=1, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
-        elif r < 0.8:
-            data = {k: torch.rot90(v, k=2, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
-        else:
-            data = {k: torch.rot90(v, k=3, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
-        return apply_local_wave_stretch(data)
-
-    def _apply_extra_view_augment(self, data):
-        aug_fns = [
-            apply_overexposure_image,
-            apply_edge_artifact_image,
-            apply_bond_color_shift,
-        ]
-        selected = [fn for fn in aug_fns if random.random() < STRATEGY_AUG_PROB]
-        if not selected:
-            selected = [random.choice(aug_fns)]
-        output = data
-        for aug_fn in selected:
-            output = aug_fn(output)
-        return output
-
-    def _build_strategy_pair_batch(self, imgs, gt, masks):
-        ori_imgs = []
-        ori_gt = []
-        ori_masks = []
-        aug_imgs = []
-        aug_gt = []
-        aug_masks = []
-
-        for image, rebuild, mask in zip(imgs, gt, masks):
-            image_u8 = self._denormalize_for_aug(image)
-            rebuild_u8 = self._denormalize_for_aug(rebuild)
-            shared = self._apply_shared_pair_augment(image_u8, rebuild_u8, mask)
-            aug = self._apply_extra_view_augment({
-                "image": shared["image"].clone(),
-                "rebuild": shared["rebuild"].clone(),
-                "mask": shared["mask"].clone(),
-            })
-
-            ori_imgs.append(self._normalize_after_aug(shared["image"]))
-            ori_gt.append(self._normalize_after_aug(shared["rebuild"]))
-            ori_masks.append(shared["mask"].long())
-            aug_imgs.append(self._normalize_after_aug(aug["image"]))
-            aug_gt.append(self._normalize_after_aug(aug["rebuild"]))
-            aug_masks.append(aug["mask"].long())
-
-        pair_imgs = torch.cat([torch.stack(ori_imgs, dim=0), torch.stack(aug_imgs, dim=0)], dim=0)
-        pair_gt = torch.cat([torch.stack(ori_gt, dim=0), torch.stack(aug_gt, dim=0)], dim=0)
-        pair_masks = torch.cat([torch.stack(ori_masks, dim=0), torch.stack(aug_masks, dim=0)], dim=0)
-        return pair_imgs, pair_gt, pair_masks
-
     def _sample_strategy_supervision_indices(self, batch_size, device):
+        # 全部 batch_size 个样本参与任务损失
+        # 每个样本以 STRATEGY_AUG_PROB 概率选 aug 视角，与普通训练的增强概率对齐
+        # pair batch 布局：[ori_0..ori_{n-1}, aug_0..aug_{n-1}]
         base = torch.arange(batch_size, device=device)
         use_aug = torch.rand(batch_size, device=device) < STRATEGY_AUG_PROB
         return base + use_aug.long() * batch_size
@@ -1061,8 +1036,53 @@ class RunNetworks():
     def _select_batch(self, tensor, indices):
         return tensor.index_select(0, indices)
 
-    def _compute_strategy_loss(self, strategy, batch_size):
-        features = getattr(self.model, 'strategy_features', {})
+    def _forward_model(self, model, imgs):
+        return ensure_model_output(model(imgs))
+
+    def _make_task_batch(self, masks, gt):
+        return {
+            "mask": masks,
+            "rebuild": gt,
+        }
+
+    def _select_model_output(self, outputs, indices):
+        selected = {}
+        for key, value in outputs.items():
+            if isinstance(value, torch.Tensor):
+                selected[key] = self._select_batch(value, indices)
+            elif isinstance(value, dict):
+                selected[key] = {
+                    sub_key: self._select_batch(sub_value, indices)
+                    if isinstance(sub_value, torch.Tensor) else sub_value
+                    for sub_key, sub_value in value.items()
+                }
+            else:
+                selected[key] = value
+        return selected
+
+    def _loss_item(self, loss_dict, key):
+        value = loss_dict.get(key)
+        if value is None:
+            return 0.0
+        if isinstance(value, torch.Tensor):
+            return value.detach().item()
+        return float(value)
+
+    def _build_loader_kwargs(self, num_workers, pin_memory=True, prefetch_factor=None):
+        kwargs = {
+            "num_workers": int(num_workers),
+            "pin_memory": pin_memory,
+        }
+        if kwargs["num_workers"] > 0 and prefetch_factor is not None:
+            kwargs["prefetch_factor"] = int(prefetch_factor)
+        return kwargs
+
+    def _compute_strategy_loss(self, strategy, batch_size, outputs=None):
+        features = {}
+        if isinstance(outputs, dict):
+            features = outputs.get("features", {}) or {}
+        if not features:
+            features = getattr(self.model, 'strategy_features', {})
         if strategy == 'srpdg':
             loss = 0.0
             for key in ('attn_down2', 'attn_down3'):
@@ -1126,6 +1146,8 @@ class RunNetworks():
             return model.ppm
         if model_name in ('Release_lightly', 'Release_lightly_extra', 'Custom'):
             return model.down4
+        if model_name in ('ResNet', 'IEResNet', 'IEXResNet'):
+            return model.layer4
 
         # Fallback for unknown model names.
         if hasattr(model, 'ppm'):
@@ -1175,7 +1197,7 @@ class RunNetworks():
         self.student_model = self._build_model(self.student_model_name, custom_cfg=student_custom_cfg)
 
         teacher_model_path = distill_cfg['teacher_model_path']
-        self.teacher_model.load_state_dict(torch.load(teacher_model_path), strict=False)
+        self._load_checkpoint_flexible(self.teacher_model, teacher_model_path, name="distill.teacher")
         self.teacher_model.eval()
         for p in self.teacher_model.parameters():
             p.requires_grad = False
@@ -1183,7 +1205,7 @@ class RunNetworks():
         student_pretrained_cfg = distill_cfg.get('student_pretrained', {'use': False})
         if student_pretrained_cfg.get('use', False):
             student_model_path = student_pretrained_cfg['model_path']
-            self.student_model.load_state_dict(torch.load(student_model_path), strict=False)
+            self._load_checkpoint_flexible(self.student_model, student_model_path, name="distill.student_pretrained")
             # Legacy behavior: try to resume sidecar adapter checkpoint.
             self.adapter_resume_path = os.path.splitext(student_model_path)[0] + '_adapter.pth'
             if not os.path.exists(self.adapter_resume_path):
@@ -1221,7 +1243,7 @@ class RunNetworks():
         self.teacher_adapter = nn.Conv2d(in_channels, out_channels, kernel_size=1).to(self.device)
 
         if self.adapter_resume_path is not None and os.path.exists(self.adapter_resume_path):
-            self.teacher_adapter.load_state_dict(torch.load(self.adapter_resume_path), strict=False)
+            self._load_checkpoint_flexible(self.teacher_adapter, self.adapter_resume_path, name="distill.teacher_adapter")
             print(f"Loaded adapter checkpoint: {self.adapter_resume_path}")
 
         if not self.teacher_adapter_trainable:
@@ -1316,6 +1338,125 @@ class RunNetworks():
         print(f"\n[LR] epoch {epoch}: {old_lr_text} -> {new_lr:.6g}")
 
 
+    def _load_checkpoint_flexible(self, model, model_path, name="model"):
+        """
+        Load only compatible checkpoint tensors.
+
+        A tensor is compatible when its key exists in the current model and its
+        shape is identical. All other current model tensors keep their initial
+        random values.
+        """
+        model_path = os.fspath(model_path)
+        if not model_path.strip():
+            raise RuntimeError(f"Error: checkpoint path is empty for `{name}`.")
+        if not os.path.isfile(model_path):
+            raise RuntimeError(f"Error: checkpoint not found for `{name}`: {model_path}")
+
+        print(f"[Checkpoint:{name}] Loading flexible weights from: {model_path}")
+        checkpoint = torch.load(model_path, map_location=torch.device(self.device))
+        checkpoint_state = self._extract_state_dict_from_checkpoint(checkpoint, model_path)
+        checkpoint_state = self._normalize_checkpoint_keys(checkpoint_state)
+        model_state = model.state_dict()
+
+        loadable_state = {}
+        unexpected_keys = []
+        shape_mismatch_keys = []
+        non_tensor_keys = []
+
+        for key, value in checkpoint_state.items():
+            if key not in model_state:
+                unexpected_keys.append(key)
+                continue
+
+            target_value = model_state[key]
+            if not hasattr(value, "shape") or not hasattr(target_value, "shape"):
+                non_tensor_keys.append(key)
+                continue
+
+            source_shape = tuple(value.shape)
+            target_shape = tuple(target_value.shape)
+            if source_shape != target_shape:
+                shape_mismatch_keys.append((key, source_shape, target_shape))
+                continue
+
+            loadable_state[key] = value
+
+        model.load_state_dict(loadable_state, strict=False)
+        missing_keys = [key for key in model_state.keys() if key not in loadable_state]
+
+        print(
+            f"[Checkpoint:{name}] loaded {len(loadable_state)}/{len(model_state)} current keys "
+            f"from {len(checkpoint_state)} checkpoint keys."
+        )
+        self._print_checkpoint_key_preview(
+            name,
+            "missing or randomly initialized keys",
+            missing_keys,
+        )
+        self._print_checkpoint_key_preview(
+            name,
+            "extra checkpoint keys ignored",
+            unexpected_keys,
+        )
+        self._print_checkpoint_key_preview(
+            name,
+            "shape-mismatched keys ignored",
+            shape_mismatch_keys,
+            formatter=lambda item: f"{item[0]}: checkpoint{item[1]} -> model{item[2]}",
+        )
+        self._print_checkpoint_key_preview(
+            name,
+            "non-tensor entries ignored",
+            non_tensor_keys,
+        )
+
+        if not loadable_state:
+            print(
+                f"[Checkpoint:{name}] Warning: no compatible weights were loaded; "
+                "the model remains randomly initialized."
+            )
+
+        return {
+            "loaded": list(loadable_state.keys()),
+            "missing": missing_keys,
+            "unexpected": unexpected_keys,
+            "shape_mismatch": shape_mismatch_keys,
+            "non_tensor": non_tensor_keys,
+        }
+
+    def _extract_state_dict_from_checkpoint(self, checkpoint, model_path):
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(
+                f"Error: unsupported checkpoint format at {model_path}: {type(checkpoint)}"
+            )
+
+        for key in ("model", "state_dict", "model_state_dict"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+
+        return checkpoint
+
+    def _normalize_checkpoint_keys(self, state_dict):
+        normalized = {}
+        for key, value in state_dict.items():
+            if not isinstance(key, str):
+                continue
+            new_key = key[7:] if key.startswith("module.") else key
+            normalized[new_key] = value
+        return normalized
+
+    def _print_checkpoint_key_preview(self, name, title, items, formatter=str, limit=10):
+        if not items:
+            return
+
+        print(f"[Checkpoint:{name}] {title}: {len(items)}")
+        for item in items[:limit]:
+            print(f"  - {formatter(item)}")
+        if len(items) > limit:
+            print(f"  ... {len(items) - limit} more")
+
+
     def _resolve_dataset_roots(self, dataset_path, cfg_key):
         if isinstance(dataset_path, (str, os.PathLike)):
             roots = [os.fspath(dataset_path)]
@@ -1339,6 +1480,18 @@ class RunNetworks():
         print(f"{cfg_key} roots ({len(roots)}): {roots}")
         return roots
 
+
+    def _sync_device_for_timing(self):
+        if self.device == 'cuda' and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _start_inference_timer(self):
+        self._sync_device_for_timing()
+        return time.perf_counter()
+
+    def _stop_inference_timer(self, start_time):
+        self._sync_device_for_timing()
+        return time.perf_counter() - start_time
 
 
     def _init_data_path(self,save_path,logs_file):

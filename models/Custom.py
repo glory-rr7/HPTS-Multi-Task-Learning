@@ -6,6 +6,7 @@ from typing import  Type, Union
 from models.networks import ConvWithActivation, Refinement, DoubleConv,Up,PPM,FFP,OutConv,adjust_size
 from models.networks import LocalAttention
 from models.networks import ELA,CoordAtt,CBAM,ECA,SA,SE
+from models.model_output import make_model_output
 
 # base: 32  # 参数量,默认32，必须是8的倍数，建议8--64，可参考满血版位64，轻量版32
 # refinement: True  # 精修复模块，与骨干网络串行的网络模块，占用额外显存较小，但会增加耗时
@@ -149,12 +150,12 @@ class ResNet_UNet(nn.Module):
         x3 = self.down2(x2)#shape2
         self.strategy_features["down2"] = x3
         if self.enable_srpdg_attention:
-            self.strategy_features["attn_down2"] = self.srpdg_attn_down2(x3)["attn"]
+            self.strategy_features["attn_down2"] = self.srpdg_attn_down2(x3, return_x=False)["attn"]
 
         x4 = self.down3(x3)
         self.strategy_features["down3"] = x4
         if self.enable_srpdg_attention:
-            self.strategy_features["attn_down3"] = self.srpdg_attn_down3(x4)["attn"]
+            self.strategy_features["attn_down3"] = self.srpdg_attn_down3(x4, return_x=False)["attn"]
 
         x5 = self.down4(x4)
 
@@ -197,7 +198,97 @@ class ResNet_UNet(nn.Module):
             x_o_unet = F.interpolate(x, scale_factor=factor, mode='bilinear', align_corners=False)
             x = F.interpolate(x, scale_factor=factor, mode='bilinear', align_corners=False)
             mm = F.interpolate(mm, scale_factor=factor, mode='nearest')
-        return xo1, xo2, x_o_unet, x, mm
+        return make_model_output(
+            x1=xo1,
+            x2=xo2,
+            x3=x_o_unet,
+            output=x,
+            mask_logits=mm,
+            features=self.strategy_features,
+        )
+
+    def forward_strategy(self, x, select_idx):
+        """
+        Strategy training forward.
+
+        The full 2-view batch is kept through down3 so SRPDG/CORAL can backprop
+        through paired features, then only selected samples continue through the
+        expensive reconstruction and segmentation heads.
+        """
+        self.strategy_features = {}
+        select_idx = select_idx.to(device=x.device, dtype=torch.long)
+        if self.down_sample != 1:
+            x = F.interpolate(x, scale_factor=self.down_sample, mode='bilinear', align_corners=True)
+
+        identity = x
+        shape0 = x.shape
+        x1 = self.inc(x)
+        con_x1 = x1
+        x2 = self.down1(x1)
+        shape1 = x2.shape
+        con_x2 = x2
+        x3 = self.down2(x2)
+        self.strategy_features["down2"] = x3
+        if self.enable_srpdg_attention:
+            self.strategy_features["attn_down2"] = self.srpdg_attn_down2(x3, return_x=False)["attn"]
+
+        x4 = self.down3(x3)
+        self.strategy_features["down3"] = x4
+        if self.enable_srpdg_attention:
+            self.strategy_features["attn_down3"] = self.srpdg_attn_down3(x4, return_x=False)["attn"]
+
+        identity = identity.index_select(0, select_idx)
+        x1 = x1.index_select(0, select_idx)
+        con_x1 = con_x1.index_select(0, select_idx)
+        x2 = x2.index_select(0, select_idx)
+        con_x2 = con_x2.index_select(0, select_idx)
+        x3 = x3.index_select(0, select_idx)
+        x4 = x4.index_select(0, select_idx)
+        shape0 = identity.shape
+        shape1 = x2.shape
+
+        x5 = self.down4(x4)
+
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        xo1 = self.xo1(x)
+        mm = self.mask1(x, x2)
+
+        mm = self.mask2(mm, x1)
+        mm = self.mask3(mm)
+
+        x = self.up3(x, x2)
+        xo2 = self.xo2(x)
+        x = self.up4(x, x1)
+
+        if self.ffp is not None:
+            ffp = self.ffp(identity)
+            x = self.fusion(torch.cat([x, ffp], dim=1))
+            del ffp
+        else:
+            x = self.fusion(x)
+
+        x_o_unet = self.outc(x)
+
+        if self.refinement is not None:
+            x = self.refinement(x, identity, con_x1, con_x2, shape0, shape1)
+        else:
+            x = x_o_unet
+        if self.down_sample != 1:
+            factor = 1 / self.down_sample
+            xo1 = F.interpolate(xo1, scale_factor=factor, mode='bilinear', align_corners=False)
+            xo2 = F.interpolate(xo2, scale_factor=factor, mode='bilinear', align_corners=False)
+            x_o_unet = F.interpolate(x, scale_factor=factor, mode='bilinear', align_corners=False)
+            x = F.interpolate(x, scale_factor=factor, mode='bilinear', align_corners=False)
+            mm = F.interpolate(mm, scale_factor=factor, mode='nearest')
+        return make_model_output(
+            x1=xo1,
+            x2=xo2,
+            x3=x_o_unet,
+            output=x,
+            mask_logits=mm,
+            features=self.strategy_features,
+        )
 
     def _make_layer(
             self,

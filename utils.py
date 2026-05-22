@@ -4,9 +4,10 @@ from torchvision import transforms
 from torchvision.utils import save_image
 import numpy as np
 import random
+from models.model_output import ensure_model_output
 
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+IMAGENET_MEAN = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).view(3, 1, 1)
 
 
 def _denormalize_imagenet_rgb_tensor(tensor):
@@ -66,22 +67,18 @@ def sample_images(valdataset, model, save_dir):
         real_B = real_B.to(device)
         mask = mask.to(device)
 
-        if model.return_num() == 1:
-            output = model(real_A)
-            label = mask
-        elif model.return_num() == 4:
-            _, _, output, label = model(real_A)
-        else:
-            _, _, _, output, label = model(real_A)
+        outputs = ensure_model_output(model(real_A))
+        output = outputs["output"]
+        label = outputs["mask_logits"]
 
 
         label = torch.argmax(label, 1)
         label = label.unsqueeze(0)
 
 
-        real_A = (real_A - real_A.min()) / (real_A.max() - real_A.min())
-        real_B = (real_B - real_B.min()) / (real_B.max() - real_B.min())
-        output = (output - output.min()) / (output.max() - output.min())
+        real_A = _denormalize_imagenet_rgb_tensor(real_A).clamp(0.0, 1.0)
+        real_B = _denormalize_imagenet_rgb_tensor(real_B).clamp(0.0, 1.0)
+        output = _denormalize_imagenet_rgb_tensor(output).clamp(0.0, 1.0)
         mask = maskToTensor(mask,device)
         label = maskToTensor(label,device)
         # Concatenate images
@@ -94,7 +91,7 @@ def sample_images(valdataset, model, save_dir):
 
     model.train()
 
-    save_image(large_image, save_dir, nrow=1, normalize=True)
+    save_image(large_image, save_dir, nrow=1, normalize=False)
     print(f"Image saved to {save_dir}")
 
 def save_tensor_as_image(tensor, filename, imagenet_denorm=True):
@@ -107,13 +104,13 @@ def save_tensor_as_image(tensor, filename, imagenet_denorm=True):
             - (1, C, H, W)   带批次维度的彩色图
             - (B, C, H, W)   仅当B=1时支持
         filename (str): 输出文件名（需包含扩展名）
-        imagenet_denorm (bool): 对 3 通道 float 张量是否先按 ImageNet
-            mean/std 做反归一化。默认 True，适合保存 dataloader/model 中
-            已归一化的 RGB 图像；mask 等非归一化张量请传 False。
+        imagenet_denorm (bool): 兼容旧参数名。为 True 时按当前默认
+            mean/std 做反归一化；当前默认 mean=(0,0,0), std=(1,1,1)。
+            mask 等非归一化张量请传 False。
 
     支持数据类型：
         - torch.uint8       直接保存
-        - torch.float       3 通道默认先按 ImageNet 反归一化，再裁剪到 [0,1]
+        - torch.float       3 通道默认按当前 mean/std 反归一化，再裁剪到 [0,1]
     """
     # 移除梯度追踪并转CPU
     tensor = tensor.detach().cpu()
@@ -165,7 +162,7 @@ def save_tensor_as_image(tensor, filename, imagenet_denorm=True):
 def get_transformer():
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0])
     ])
     return transform
 

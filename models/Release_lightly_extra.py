@@ -5,6 +5,7 @@ from torchvision.models.resnet import Bottleneck, BasicBlock, conv1x1, conv3x3
 from typing import Type, Union
 from models.networks import ConvWithActivation, get_pad, DeConvWithActivation, DoubleConv, Up, PPM, FFP, OutConv, \
     adjust_size, ELA
+from models.model_output import make_model_output
 
 
 class ResNet_UNet(nn.Module):
@@ -90,7 +91,7 @@ class ResNet_UNet(nn.Module):
         xo2 = F.interpolate(xo2, scale_factor=2, mode='bilinear', align_corners=False)
         x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
         mm = F.interpolate(mm, scale_factor=2, mode='nearest')
-        return xo1, xo2, x,x, mm
+        return make_model_output(x1=xo1, x2=xo2, x3=x, output=x, mask_logits=mm)
 
     def _make_layer(
             self,
@@ -152,4 +153,3 @@ if __name__ == '__main__':
     from torchinfo import summary
 
     summary(model, input_size=(2, 3, 256, 256), device="cpu")
-

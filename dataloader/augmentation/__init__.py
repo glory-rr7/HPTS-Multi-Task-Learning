@@ -9,6 +9,8 @@ from .local_wave_stretch_aug import apply_local_wave_stretch
 from .overexposure_image_aug import apply_overexposure_image
 from .scaning_local_jitter_aug import apply_scaning_local_jitter
 
+STRATEGY_AUG_PROB = 0.6
+
 AugFn = Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
 
 # 分组增强配置
@@ -113,6 +115,51 @@ def apply_random_augmentation(
     return apply_group_ab_augmentation(data, method_prob=method_prob)
 
 
+def apply_strategy_shared_aug(data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Strategy 共享几何增强：随机翻转/旋转 + 局部波动拉伸。
+    ori 和 aug 两个视角共享同一空间变换，保证语义对齐。
+    data 需包含 "image"(uint8)、"rebuild"(uint8)、"mask"(uint8) 三个键。
+    """
+    r = random.random()
+    if r < 0.2:
+        data = {k: torch.flip(v, dims=[2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+    elif r < 0.4:
+        data = {k: torch.flip(v, dims=[1]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+    elif r < 0.6:
+        data = {k: torch.rot90(v, k=1, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+    elif r < 0.8:
+        data = {k: torch.rot90(v, k=2, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+    else:
+        data = {k: torch.rot90(v, k=3, dims=[1, 2]) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+
+    if random.random() < 0.3:
+        data = apply_scaning_local_jitter(data)
+    return data
+
+
+def apply_strategy_extra_aug(
+    data: Dict[str, torch.Tensor],
+    prob: float = STRATEGY_AUG_PROB,
+) -> Dict[str, torch.Tensor]:
+    """
+    Strategy extra-view 增强：从过曝光、边缘伪影、颜色偏移中随机组合。
+    只修改 aug 视角，ori 视角不调用此函数。
+    """
+    aug_fns = [
+        apply_overexposure_image,
+        apply_edge_artifact_image,
+        apply_bond_color_shift,
+    ]
+    selected = [fn for fn in aug_fns if random.random() < prob]
+    if not selected:
+        selected = [random.choice(aug_fns)]
+    output = data
+    for aug_fn in selected:
+        output = aug_fn(output)
+    return output
+
+
 __all__ = [
     "apply_scaning_local_jitter",
     "apply_local_wave_stretch",
@@ -123,8 +170,11 @@ __all__ = [
     "apply_group_b_augmentation",
     "apply_group_ab_augmentation",
     "apply_random_augmentation",
+    "apply_strategy_shared_aug",
+    "apply_strategy_extra_aug",
     "AUG_GROUP_A_METHODS",
     "AUG_GROUP_B_METHODS",
     "AUGMENTATION_GROUP_CHOICES",
     "AUGMENTATION_METHODS",
+    "STRATEGY_AUG_PROB",
 ]

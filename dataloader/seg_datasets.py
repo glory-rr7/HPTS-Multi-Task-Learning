@@ -8,7 +8,7 @@ import torchvision.transforms as transforms
 import torchvision.io as tvio
 from torch.utils.data import Dataset, DataLoader
 
-from dataloader.augmentation import apply_random_augmentation
+from dataloader.augmentation import apply_random_augmentation, apply_strategy_shared_aug, apply_strategy_extra_aug
 
 
 def _normalize_roots(root):
@@ -26,14 +26,25 @@ def _normalize_roots(root):
     return roots
 
 
+def _print_if_label_out_of_range(label, label_path, *, context):
+    if label.numel() == 0:
+        print(f"[DatasetLabelError] {context}: empty label, path={label_path}")
+        return
+    label_min = int(label.min().item())
+    label_max = int(label.max().item())
+    if label_min < 0 or label_max > 3:
+        print(f"[DatasetLabelError] {context}: path={label_path}")
+
+
 class SegImageDataset(Dataset):
-    def __init__(self, root, mode="train", use_aug=False, aug_prob=0.6):
+    def __init__(self, root, mode="train", use_aug=False, aug_prob=0.6, use_strategy=False):
         self.normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
+            mean=[0.0, 0.0, 0.0],
+            std=[1.0, 1.0, 1.0]
         )
         self.use_aug = use_aug
         self.aug_prob = aug_prob
+        self.use_strategy = use_strategy
         self.roots = _normalize_roots(root)
 
         self.samples = []
@@ -76,6 +87,7 @@ class SegImageDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
+        label_path = sample["label"]
 
         # read_image 直接返回 (C, H, W) uint8 tensor，比 PIL 快
         img = tvio.read_image(sample["image"])      # (3, H, W)
@@ -91,6 +103,29 @@ class SegImageDataset(Dataset):
         if label.shape[0] > 1:
             label = label[0:1]
 
+        if self.use_strategy:
+            # Strategy 模式：生成共享几何变换的两个视角
+            data = {"image": img, "mask": label.to(dtype=torch.uint8), "rebuild": reb}
+
+            # 共享几何 aug（flip/rot + wave stretch），ori 和 aug 视角共用
+            data = apply_strategy_shared_aug(data)
+
+            # ori 视角：直接 normalize
+            ori_img = self.normalize(data["image"].float() / 255.0)
+            ori_reb = self.normalize(data["rebuild"].float() / 255.0)
+            ori_label = data["mask"].long()
+
+            # aug 视角：在共享 aug 基础上叠加 extra aug
+            aug_data = apply_strategy_extra_aug(dict(data))
+            aug_img = self.normalize(aug_data["image"].float() / 255.0)
+            aug_reb = self.normalize(aug_data["rebuild"].float() / 255.0)
+            aug_label = aug_data["mask"].long()
+            _print_if_label_out_of_range(ori_label, label_path, context="SegImageDataset/strategy/ori")
+            _print_if_label_out_of_range(aug_label, label_path, context="SegImageDataset/strategy/aug")
+
+            return ori_img, ori_reb, ori_label, aug_img, aug_reb, aug_label
+
+        # 普通模式
         if random.random() < 0.5:
             img, reb, label = random_flip(img, reb, label)
 
@@ -103,6 +138,7 @@ class SegImageDataset(Dataset):
         img = self.normalize(img.float() / 255.0)
         reb = self.normalize(reb.float() / 255.0)
         label = label.long()  # (1, H, W)，值 ∈ {0,1,2,3}
+        _print_if_label_out_of_range(label, label_path, context="SegImageDataset")
 
         return img, reb, label
 

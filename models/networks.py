@@ -66,7 +66,7 @@ class LocalAttention(nn.Module):
                 kernel_size=1,
             )
 
-    def forward(self, q, k=None):
+    def forward(self, q, k=None, return_x=True):
         if k is None:
             k = q
         outputs = []
@@ -79,39 +79,41 @@ class LocalAttention(nn.Module):
             q_permuted = q.permute(0, 2, 3, 1)
             attn = torch.matmul(q_permuted, self.k)
             attn = torch.softmax(attn, dim=-1)
-            out_external = torch.matmul(attn, self.v)
-            out_external = out_external.permute(0, 3, 1, 2)
-            outputs.append(out_external)
+            if return_x:
+                out_external = torch.matmul(attn, self.v)
+                out_external = out_external.permute(0, 3, 1, 2)
+                outputs.append(out_external)
             attn_weight.append(attn.permute(0, 3, 1, 2))
 
         if use_self_attn:
-            v = self.v_project(k)
-
             k_shift = self.offset_tensor(k)
-            v_shift = self.offset_tensor(v)
 
             q_permuted = q.permute(0, 2, 3, 1).unsqueeze(-2)
             k_shift_permuted = k_shift.permute(0, 2, 3, 1, 4)
             attn = torch.matmul(q_permuted, k_shift_permuted)
             attn = torch.softmax(attn, dim=-1)
 
-            v_shift_permuted = v_shift.permute(0, 2, 3, 4, 1)
-            attn_out = torch.matmul(attn, v_shift_permuted)
-            attn_out = attn_out.squeeze(-2).permute(0, 3, 1, 2)
-            outputs.append(attn_out)
+            if return_x:
+                v = self.v_project(k)
+                v_shift = self.offset_tensor(v)
+                v_shift_permuted = v_shift.permute(0, 2, 3, 4, 1)
+                attn_out = torch.matmul(attn, v_shift_permuted)
+                attn_out = attn_out.squeeze(-2).permute(0, 3, 1, 2)
+                outputs.append(attn_out)
             attn_weight.append(attn.squeeze(-2).permute(0, 3, 1, 2))
 
-        if len(outputs) == 1:
-            outputs = outputs[0]
+        if len(attn_weight) == 1:
             attn_weight = attn_weight[0]
         else:
-            outputs = torch.cat(outputs, dim=1)
             attn_weight = torch.cat(attn_weight, dim=1)
 
-        return {
-            "x": outputs,
-            "attn": attn_weight,
-        }
+        result = {"attn": attn_weight}
+        if return_x:
+            if len(outputs) == 1:
+                result["x"] = outputs[0]
+            else:
+                result["x"] = torch.cat(outputs, dim=1)
+        return result
 
 class ConvWithActivation(torch.nn.Module):
     """

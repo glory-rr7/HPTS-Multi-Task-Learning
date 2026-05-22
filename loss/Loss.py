@@ -39,13 +39,13 @@ def SimilarityLoss(
     fake,
     gt,
     *,
-    mean=(0.485, 0.456, 0.406),     # ImageNet 默认
-    std=(0.229, 0.224, 0.225),
+    mean=(0.0, 0.0, 0.0),
+    std=(1.0, 1.0, 1.0),
     SSIM=True,
 ):
     """
-    fake / gt : 4-D tensor  [B, C, H, W]，已做过 ImageNet Normalize。
-    先“反标准化”回 0-1 再计算 L1 / MSE / PSNR / SSIM。
+    fake / gt : 4-D tensor  [B, C, H, W]。
+    按给定 mean/std 反标准化回 0-1 后计算 L1 / MSE / PSNR / SSIM。
     """
 
     # ---- 1. 反标准化：x = x * std + mean  ---------------------------------
@@ -83,14 +83,76 @@ def SimilarityLoss(
 
     return l1_loss, mse_loss, psnr, ssim
 
+
+def _first_present(mapping, keys):
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    raise KeyError(f"Missing required key, expected one of: {keys}")
+
+
+def _parse_multitask_inputs(args):
+    if len(args) >= 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+        batch, outputs = args[0], args[1]
+        mask = _first_present(batch, ("mask", "masks", "label"))
+        gt = _first_present(batch, ("rebuild", "target", "gt"))
+        return (
+            mask,
+            outputs["x1"],
+            outputs["x2"],
+            outputs.get("x3", outputs["output"]),
+            outputs["output"],
+            outputs["mask_logits"],
+            gt,
+        )
+
+    if len(args) >= 7:
+        mask, x_o1, x_o2, x_o3, output, mm, gt = args[:7]
+        return mask, x_o1, x_o2, x_o3, output, mm, gt
+
+    raise TypeError("SegMultTaskLoss expects (batch_dict, output_dict) or legacy tensor arguments.")
+
+
+def _loss_dict(total, **items):
+    output = {"total": total}
+    output.update(items)
+    return output
+
+
+CE_IGNORE_INDEX = -100
+
+
+def _sanitize_ce_target(logits, target, *, context):
+    target = target.long()
+    num_classes = int(logits.shape[1])
+    invalid = (target < 0) | (target >= num_classes)
+    if not bool(invalid.any().item()):
+        return target, True
+
+    invalid_values = [int(v) for v in torch.unique(target[invalid].detach()).cpu().tolist()]
+    invalid_pixels = int(invalid.sum().item())
+    total_pixels = int(target.numel())
+    print(
+        f"[LossLabelError] {context}: invalid_values={invalid_values}, "
+        f"invalid_pixels={invalid_pixels}/{total_pixels}, num_classes={num_classes}; "
+        f"set invalid pixels to ignore_index={CE_IGNORE_INDEX}"
+    )
+
+    valid_pixels = total_pixels - invalid_pixels
+    target = target.clone()
+    target[invalid] = CE_IGNORE_INDEX
+    return target, valid_pixels > 0
+
+
 class SegMultTaskLoss(nn.Module):
     def __init__(self):
         super(SegMultTaskLoss, self).__init__()
         self.l1 = nn.L1Loss()
         weights = torch.tensor([1.0, 4.0, 5.0, 6.0], dtype=torch.float32)
-        self.ce = nn.CrossEntropyLoss(weight=weights)
+        self.ce = nn.CrossEntropyLoss(weight=weights, ignore_index=CE_IGNORE_INDEX)
 
-    def forward(self, mask, x_o1, x_o2, x_o3, output, mm, gt, idx):
+    def forward(self, *args, **kwargs):
+        mask, x_o1, x_o2, x_o3, output, mm, gt = _parse_multitask_inputs(args)
         # 初始化四个掩码，分别对应不同的标签值
         mask0 = (mask == 0).float()  # 标签为0的掩码 背景
         mask1 = (mask == 1).float()  # 标签为1的掩码 手写
@@ -111,7 +173,12 @@ class SegMultTaskLoss(nn.Module):
 
         # print(mm.shape,mask.shape)
         # mask_loss = dice_loss(mm,  mask)
-        mask_loss = self.ce(mm, mask.squeeze(1))
+        mask_target, has_valid_target = _sanitize_ce_target(
+            mm,
+            mask.squeeze(1),
+            context="SegMultTaskLoss",
+        )
+        mask_loss = self.ce(mm, mask_target) if has_valid_target else mm.sum() * 0.0
 
         # 计算多尺度重建损失
         msrloss = (0.8 * self.l1(mask0 * x_o3, mask0 * gt) +
@@ -151,7 +218,12 @@ class SegMultTaskLoss(nn.Module):
         # GLoss = msrloss + holeLoss + validAreaLoss + mask_loss
         GLoss = msrloss + refinement_loss + mask_loss
 
-        return GLoss.sum()
+        return _loss_dict(
+            GLoss.sum(),
+            multiscale=msrloss,
+            refinement=refinement_loss,
+            mask=mask_loss,
+        )
 
 
 class SegMultTaskLoss3Tags(nn.Module):
@@ -159,13 +231,14 @@ class SegMultTaskLoss3Tags(nn.Module):
         super(SegMultTaskLoss3Tags, self).__init__()
         self.l1 = nn.L1Loss()
         weights = torch.tensor([1.0, 4.0, 5.0], dtype=torch.float32)
-        self.ce = nn.CrossEntropyLoss(weight=weights)
+        self.ce = nn.CrossEntropyLoss(weight=weights, ignore_index=CE_IGNORE_INDEX)
 
     @staticmethod
     def _to_three_tag_mask(mask):
         return torch.where(mask == 3, torch.ones_like(mask), mask)
 
-    def forward(self, mask, x_o1, x_o2, x_o3, output, mm, gt, idx):
+    def forward(self, *args, **kwargs):
+        mask, x_o1, x_o2, x_o3, output, mm, gt = _parse_multitask_inputs(args)
         mask = self._to_three_tag_mask(mask)
         mask0 = (mask == 0).float()  # 背景
         mask1 = (mask == 1).float()  # 手写；重叠区域也映射到该类
@@ -175,7 +248,12 @@ class SegMultTaskLoss3Tags(nn.Module):
                            8 * self.l1(mask1 * output, mask1 * gt) +
                            10 * self.l1(mask2 * output, mask2 * gt))
 
-        mask_loss = self.ce(mm, mask.squeeze(1))
+        mask_target, has_valid_target = _sanitize_ce_target(
+            mm,
+            mask.squeeze(1),
+            context="SegMultTaskLoss3Tags",
+        )
+        mask_loss = self.ce(mm, mask_target) if has_valid_target else mm.sum() * 0.0
 
         msrloss = (0.8 * self.l1(mask0 * x_o3, mask0 * gt) +
                    4 * self.l1(mask1 * x_o3, mask1 * gt) +
@@ -201,7 +279,12 @@ class SegMultTaskLoss3Tags(nn.Module):
 
         GLoss = msrloss + refinement_loss + mask_loss
 
-        return GLoss.sum()
+        return _loss_dict(
+            GLoss.sum(),
+            multiscale=msrloss,
+            refinement=refinement_loss,
+            mask=mask_loss,
+        )
 
 
 
@@ -212,7 +295,16 @@ class RefinementLoss(nn.Module):
         super(RefinementLoss, self).__init__()
         self.l1 = nn.L1Loss()
 
-    def forward(self, mask, output, gt, ):
+    def forward(self, *args, **kwargs):
+        if len(args) >= 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            batch, outputs = args[0], args[1]
+            mask = _first_present(batch, ("mask", "masks", "label"))
+            gt = _first_present(batch, ("rebuild", "target", "gt"))
+            output = outputs["output"]
+        elif len(args) >= 3:
+            mask, output, gt = args[:3]
+        else:
+            raise TypeError("RefinementLoss expects (batch_dict, output_dict) or legacy tensor arguments.")
         b, _, width, height = mask.shape
 
         # 创建 4 个单通道掩码
@@ -229,7 +321,7 @@ class RefinementLoss(nn.Module):
         refinement_loss = (2 * self.l1(mask0 * output, mask0 * gt) + 8 * self.l1(mask1 * output, mask1 * gt) +
                            10 * self.l1( mask2 * output, mask2 * gt) + 12 * self.l1(mask3 * output, mask3 * gt))
 
-        return refinement_loss
+        return _loss_dict(refinement_loss, refinement=refinement_loss)
 
 
 class RefinementLoss3Tags(nn.Module):
@@ -237,7 +329,16 @@ class RefinementLoss3Tags(nn.Module):
         super(RefinementLoss3Tags, self).__init__()
         self.l1 = nn.L1Loss()
 
-    def forward(self, mask, output, gt, ):
+    def forward(self, *args, **kwargs):
+        if len(args) >= 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            batch, outputs = args[0], args[1]
+            mask = _first_present(batch, ("mask", "masks", "label"))
+            gt = _first_present(batch, ("rebuild", "target", "gt"))
+            output = outputs["output"]
+        elif len(args) >= 3:
+            mask, output, gt = args[:3]
+        else:
+            raise TypeError("RefinementLoss3Tags expects (batch_dict, output_dict) or legacy tensor arguments.")
         mask = torch.where(mask == 3, torch.ones_like(mask), mask)
         b, _, width, height = mask.shape
 
@@ -249,7 +350,7 @@ class RefinementLoss3Tags(nn.Module):
                            8 * self.l1(mask1 * output, mask1 * gt) +
                            10 * self.l1(mask2 * output, mask2 * gt))
 
-        return refinement_loss
+        return _loss_dict(refinement_loss, refinement=refinement_loss)
 
 
 class DistillationLoss(nn.Module):
@@ -260,13 +361,25 @@ class DistillationLoss(nn.Module):
         super(DistillationLoss, self).__init__()
         self.mse = nn.MSELoss()
 
-    def forward(self, student_output, student_mm, teacher_output, teacher_mm):
+    def forward(self, *args, **kwargs):
+        if len(args) >= 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            student_outputs, teacher_outputs = args[0], args[1]
+            student_output = student_outputs["output"]
+            student_mm = student_outputs["mask_logits"]
+            teacher_output = teacher_outputs["output"]
+            teacher_mm = teacher_outputs["mask_logits"]
+        else:
+            student_output = kwargs.get("student_output", args[0] if len(args) > 0 else None)
+            student_mm = kwargs.get("student_mm", args[1] if len(args) > 1 else None)
+            teacher_output = kwargs.get("teacher_output", args[2] if len(args) > 2 else None)
+            teacher_mm = kwargs.get("teacher_mm", args[3] if len(args) > 3 else None)
+
         teacher_output = teacher_output.detach()
         teacher_mm = teacher_mm.detach()
 
         output_loss = self.mse(student_output, teacher_output)
         mask_loss = self.mse(student_mm, teacher_mm)
-        return output_loss, mask_loss
+        return _loss_dict(output_loss + mask_loss, output=output_loss, mask=mask_loss)
 
 
 def deep_feature_l2_loss(student_deep, teacher_deep):
