@@ -120,6 +120,22 @@ class RunNetworks():
         ]
 
         self.evaluate_logs_fields = ['idx', 'loss', 'L1','MSE','PSNR','SSIM','total_loss', 'total_L1','total_MSE','total_PSNR','total_SSIM','file_num']
+        self.gradient_diagnostics_fields = [
+            'epoch',
+            'batch',
+            'global_step',
+            'layer',
+            'cosine',
+            'rebuild_norm',
+            'segment_norm',
+            'norm_ratio',
+            'is_conflict',
+            'parameter_tensors',
+            'background_ratio',
+            'handwriting_ratio',
+            'print_ratio',
+            'overlap_ratio',
+        ]
 
     def work(self):
         # call function
@@ -167,6 +183,20 @@ class RunNetworks():
         # Init relative dir and file
         # 初始化训练的相关路径和日志文件
         self._init_data_path([save_models_dir, save_samples_dir],save_logs_path)
+        gradient_diagnostics_cfg = train_cfg.get('gradient_diagnostics', {})
+        gradient_diagnostics_enabled = bool(gradient_diagnostics_cfg.get('enabled', False))
+        gradient_diagnostics_interval = max(1, int(gradient_diagnostics_cfg.get('interval', 10)))
+        gradient_diagnostics_path = os.path.join(
+            str(self.data_root_path),
+            str(gradient_diagnostics_cfg.get('filename', 'gradient_diagnostics.csv')),
+        )
+        if gradient_diagnostics_enabled:
+            self._init_gradient_diagnostics(gradient_diagnostics_path)
+            print(
+                "Gradient diagnostics enabled:",
+                gradient_diagnostics_path,
+                f"(every {gradient_diagnostics_interval} batches)",
+            )
 
         # Use pretrained model
         # 如果需要使用预训练的模型，则加载预训练的模型
@@ -335,6 +365,15 @@ class RunNetworks():
                 fake_images = outputs["output"]
                 mm = outputs["mask_logits"]
                 G_loss = G_loss.sum()
+                if gradient_diagnostics_enabled and idx % gradient_diagnostics_interval == 0:
+                    self._record_gradient_diagnostics(
+                        loss_dict=task_loss_dict,
+                        masks=task_masks,
+                        epoch=epochs,
+                        batch_idx=idx,
+                        global_step=(epochs - 1) * len(traindataset) + idx,
+                        save_path=gradient_diagnostics_path,
+                    )
                 G_optimizer.zero_grad()
                 G_loss.backward()
                 G_optimizer.step()
@@ -1067,6 +1106,171 @@ class RunNetworks():
         if isinstance(value, torch.Tensor):
             return value.detach().item()
         return float(value)
+
+    def _init_gradient_diagnostics(self, save_path):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'w', newline='', encoding='utf-8') as csv_file:
+            csv.DictWriter(csv_file, fieldnames=self.gradient_diagnostics_fields).writeheader()
+
+    @staticmethod
+    def _gradient_parameter_group(parameter_name):
+        """Map shared model parameters to coarse architectural regions."""
+        name = parameter_name[7:] if parameter_name.startswith('module.') else parameter_name
+        root = name.split('.', 1)[0]
+        if root in ('inc', 'stem', 'down1', 'layer1'):
+            return 'encoder_shallow'
+        if root in ('down2', 'down3', 'layer2', 'layer3'):
+            return 'encoder_middle'
+        if root in ('down4', 'layer4', 'ppm'):
+            return 'encoder_deep'
+        if root in ('up1', 'up2'):
+            return 'shared_decoder'
+        return None
+
+    @staticmethod
+    def _gradient_statistics(gradient_pairs, eps=1e-12):
+        dot = None
+        rebuild_squared_norm = None
+        segment_squared_norm = None
+        parameter_tensors = 0
+        for rebuild_gradient, segment_gradient in gradient_pairs:
+            if rebuild_gradient is None or segment_gradient is None:
+                continue
+            pair_dot = torch.sum(rebuild_gradient * segment_gradient).double()
+            pair_rebuild_norm = torch.sum(rebuild_gradient * rebuild_gradient).double()
+            pair_segment_norm = torch.sum(segment_gradient * segment_gradient).double()
+            dot = pair_dot if dot is None else dot + pair_dot
+            rebuild_squared_norm = (
+                pair_rebuild_norm
+                if rebuild_squared_norm is None
+                else rebuild_squared_norm + pair_rebuild_norm
+            )
+            segment_squared_norm = (
+                pair_segment_norm
+                if segment_squared_norm is None
+                else segment_squared_norm + pair_segment_norm
+            )
+            parameter_tensors += 1
+
+        if parameter_tensors == 0:
+            return {
+                'cosine': float('nan'),
+                'rebuild_norm': 0.0,
+                'segment_norm': 0.0,
+                'norm_ratio': 0.0,
+                'is_conflict': '',
+                'parameter_tensors': 0,
+            }
+
+        dot = dot.item()
+        rebuild_squared_norm = rebuild_squared_norm.item()
+        segment_squared_norm = segment_squared_norm.item()
+        rebuild_norm = rebuild_squared_norm ** 0.5
+        segment_norm = segment_squared_norm ** 0.5
+        denominator = rebuild_norm * segment_norm
+        cosine = dot / denominator if denominator > eps else float('nan')
+        norm_ratio = rebuild_norm / max(segment_norm, eps)
+        return {
+            'cosine': cosine,
+            'rebuild_norm': rebuild_norm,
+            'segment_norm': segment_norm,
+            'norm_ratio': norm_ratio,
+            'is_conflict': int(cosine < 0.0) if cosine == cosine else '',
+            'parameter_tensors': parameter_tensors,
+        }
+
+    def _record_gradient_diagnostics(
+        self,
+        *,
+        loss_dict,
+        masks,
+        epoch,
+        batch_idx,
+        global_step,
+        save_path,
+    ):
+        reconstruction_terms = [
+            loss_dict.get('multiscale'),
+            loss_dict.get('refinement'),
+        ]
+        reconstruction_terms = [
+            value for value in reconstruction_terms if isinstance(value, torch.Tensor)
+        ]
+        segmentation_loss = loss_dict.get('mask')
+        if not reconstruction_terms or not isinstance(segmentation_loss, torch.Tensor):
+            return
+
+        reconstruction_loss = sum(value.sum() for value in reconstruction_terms)
+        segmentation_loss = segmentation_loss.sum()
+        named_parameters = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad and self._gradient_parameter_group(name) is not None
+        ]
+        if not named_parameters:
+            return
+
+        parameters = [parameter for _, parameter in named_parameters]
+        rebuild_gradients = torch.autograd.grad(
+            reconstruction_loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        segment_gradients = torch.autograd.grad(
+            segmentation_loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+
+        grouped_pairs = collections.defaultdict(list)
+        all_pairs = []
+        for (name, _), rebuild_gradient, segment_gradient in zip(
+            named_parameters,
+            rebuild_gradients,
+            segment_gradients,
+        ):
+            pair = (rebuild_gradient, segment_gradient)
+            grouped_pairs[self._gradient_parameter_group(name)].append(pair)
+            all_pairs.append(pair)
+        grouped_pairs['shared_all'] = all_pairs
+
+        flat_masks = masks.detach()
+        total_pixels = max(int(flat_masks.numel()), 1)
+        class_ratios = {
+            'background_ratio': int((flat_masks == 0).sum().item()) / total_pixels,
+            'handwriting_ratio': int((flat_masks == 1).sum().item()) / total_pixels,
+            'print_ratio': int((flat_masks == 2).sum().item()) / total_pixels,
+            'overlap_ratio': int((flat_masks == 3).sum().item()) / total_pixels,
+        }
+
+        rows = []
+        group_order = (
+            'encoder_shallow',
+            'encoder_middle',
+            'encoder_deep',
+            'shared_decoder',
+            'shared_all',
+        )
+        for group_name in group_order:
+            gradient_pairs = grouped_pairs.get(group_name, [])
+            statistics = self._gradient_statistics(gradient_pairs)
+            if statistics['parameter_tensors'] == 0:
+                continue
+            rows.append({
+                'epoch': epoch,
+                'batch': batch_idx,
+                'global_step': global_step,
+                'layer': group_name,
+                **statistics,
+                **class_ratios,
+            })
+
+        if rows:
+            with open(save_path, 'a', newline='', encoding='utf-8') as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=self.gradient_diagnostics_fields)
+                writer.writerows(rows)
 
     def _build_loader_kwargs(self, num_workers, pin_memory=True, prefetch_factor=None):
         kwargs = {

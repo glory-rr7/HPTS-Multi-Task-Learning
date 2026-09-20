@@ -107,6 +107,12 @@ train:
     use: False         # 是否使用多阶段损失，做实验的时候推荐不要用，微调模型的时候可以用
     epoch: 2            # 多阶段损失开始训练的批次
 
+  # 第一阶段：梯度冲突诊断。只读取梯度，不改变原有反向传播和参数更新。
+  gradient_diagnostics:
+    enabled: True
+    interval: 10       # 每隔多少个 batch 记录一次；设为 1 可记录所有 batch
+    filename: 'gradient_diagnostics.csv'
+
 validation:             # 验证集配置，训练的每一个批次训练完成之后，会验证一次模型，也就是在模型没有见过的模型上简单测试一下性能
   dataset_path: '/home/luzhixian/bak/datasets/v2.2-REAL/val'
   batch_size: 8
