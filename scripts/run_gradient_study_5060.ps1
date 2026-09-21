@@ -10,6 +10,21 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
 
+# A nested PowerShell can lose Conda's temporary PATH ordering. Prefer the
+# interpreter from the explicitly activated environment instead of whichever
+# `python` happens to be visible in the child process.
+$pythonExecutable = $null
+if ($env:CONDA_PREFIX) {
+    $condaPython = Join-Path $env:CONDA_PREFIX 'python.exe'
+    if (Test-Path -LiteralPath $condaPython -PathType Leaf) {
+        $pythonExecutable = $condaPython
+    }
+}
+if (-not $pythonExecutable) {
+    $pythonCommand = Get-Command python -ErrorAction Stop
+    $pythonExecutable = $pythonCommand.Source
+}
+
 $trainCandidates = @(
     (Join-Path $DatasetRoot 'train'),
     (Join-Path $DatasetRoot 'training')
@@ -32,8 +47,14 @@ Write-Host "Training data: $trainPath"
 Write-Host "Validation data: $validationPath"
 Write-Host "Common initialization: $InitialCheckpoint"
 Write-Host 'Methods: baseline, balance, pcgrad, balance_pcgrad'
+Write-Host "Python executable: $pythonExecutable"
 
-python .\run_gradient_study.py `
+& $pythonExecutable -c "import torch; print('PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+if ($LASTEXITCODE -ne 0) {
+    throw "The selected Python environment cannot import PyTorch: $pythonExecutable"
+}
+
+& $pythonExecutable .\run_gradient_study.py `
     --train-path $trainPath `
     --validation-path $validationPath `
     --initial-checkpoint $InitialCheckpoint `
