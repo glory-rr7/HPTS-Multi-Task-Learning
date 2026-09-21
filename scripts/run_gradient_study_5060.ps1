@@ -10,19 +10,38 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
 
-# A nested PowerShell can lose Conda's temporary PATH ordering. Prefer the
-# interpreter from the explicitly activated environment instead of whichever
-# `python` happens to be visible in the child process.
-$pythonExecutable = $null
+# A nested PowerShell can lose Conda's PATH ordering and can even inherit a
+# stale base CONDA_PREFIX. Build candidates from the active environment name,
+# then select the first interpreter that can actually import PyTorch.
+$pythonCandidates = [System.Collections.Generic.List[string]]::new()
+if ($env:CONDA_DEFAULT_ENV -and $env:CONDA_DEFAULT_ENV -ne 'base') {
+    $pythonCandidates.Add((Join-Path $env:USERPROFILE ".conda\envs\$($env:CONDA_DEFAULT_ENV)\python.exe"))
+    if ($env:CONDA_EXE) {
+        $condaRoot = Split-Path -Parent (Split-Path -Parent $env:CONDA_EXE)
+        $pythonCandidates.Add((Join-Path $condaRoot "envs\$($env:CONDA_DEFAULT_ENV)\python.exe"))
+    }
+}
 if ($env:CONDA_PREFIX) {
-    $condaPython = Join-Path $env:CONDA_PREFIX 'python.exe'
-    if (Test-Path -LiteralPath $condaPython -PathType Leaf) {
-        $pythonExecutable = $condaPython
+    $pythonCandidates.Add((Join-Path $env:CONDA_PREFIX 'python.exe'))
+}
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if ($pythonCommand) {
+    $pythonCandidates.Add($pythonCommand.Source)
+}
+
+$pythonExecutable = $null
+foreach ($candidate in ($pythonCandidates | Select-Object -Unique)) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        continue
+    }
+    & $candidate -c "import torch" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $pythonExecutable = $candidate
+        break
     }
 }
 if (-not $pythonExecutable) {
-    $pythonCommand = Get-Command python -ErrorAction Stop
-    $pythonExecutable = $pythonCommand.Source
+    throw "No Python with PyTorch was found. Candidates: $($pythonCandidates -join ', ')"
 }
 
 $trainCandidates = @(
