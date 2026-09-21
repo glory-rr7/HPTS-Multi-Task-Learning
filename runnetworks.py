@@ -3,6 +3,7 @@ import os
 # 解决多线程问题
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import csv
+import json
 import random
 import numpy as np
 import torch.optim as optim
@@ -81,7 +82,12 @@ class RunNetworks():
             self._get_model()
             # Run ID
             # 运行ID
-            self.run_id = self.model.get_name()+ '_' + dt2.now().strftime("%Y%m%d_%H%M%S")
+            experiment_name = str(config['run'].get('experiment_name', '')).strip()
+            experiment_suffix = f"_{experiment_name}" if experiment_name else ''
+            self.run_id = (
+                self.model.get_name() + experiment_suffix + '_' +
+                dt2.now().strftime("%Y%m%d_%H%M%S")
+            )
 
         # The root path of this running
         # 该次运行的根路径，用于存储相关文件
@@ -105,6 +111,9 @@ class RunNetworks():
             'MSRLoss',
             'RefinementLoss',
             'MaskLoss',
+            'GradientMethod',
+            'SegmentationGradientWeight',
+            'GradientConflictRate',
             'L1',
             'MSE',
             'PSNR',
@@ -176,6 +185,19 @@ class RunNetworks():
         print("Epoch:", train_cfg['epochs'], "  Batch size:",
               train_cfg['batch_size'])
         print("Train strategy:", train_strategy)
+        gradient_method = str(train_cfg.get('gradient_method', 'baseline')).lower()
+        valid_gradient_methods = ('baseline', 'balance', 'pcgrad', 'balance_pcgrad')
+        if gradient_method not in valid_gradient_methods:
+            raise RuntimeError(
+                f"train.gradient_method must be one of {valid_gradient_methods}, got {gradient_method!r}."
+            )
+        if gradient_method != 'baseline' and train_strategy != 'none':
+            raise RuntimeError(
+                "Gradient experiments require train.strategy=none so that only the two task "
+                "gradients differ between experiment groups."
+            )
+        self._gradient_balance_ema = None
+        print("Gradient method:", gradient_method)
         strategy_loss_weight = self._get_strategy_loss_weight(train_strategy)
         if train_strategy != 'none':
             print("Strategy loss weight:", strategy_loss_weight)
@@ -301,6 +323,7 @@ class RunNetworks():
 
         sample_images(valdataset, self.model, os.path.join(save_samples_dir, str(0) + '.png'))
         torch.save(self.model.state_dict(), os.path.join(save_models_dir, str(0) + '.pth'))
+        best_foreground_miou = -1.0
 
         #训练
         for epochs in range(1, train_cfg['epochs'] + 1):
@@ -316,6 +339,9 @@ class RunNetworks():
             epoch_msr_loss = 0
             epoch_refinement_loss = 0
             epoch_mask_loss = 0
+            epoch_segmentation_gradient_weight = 0.0
+            epoch_gradient_conflicts = 0
+            epoch_gradient_updates = 0
             epoch_L1_loss = 0
             epoch_mse_loss = 0
             epoch_psnr = 0
@@ -387,9 +413,18 @@ class RunNetworks():
                         save_path=gradient_diagnostics_path,
                     )
                 G_optimizer.zero_grad()
-                G_loss.backward()
+                gradient_update = self._apply_multitask_gradients(
+                    loss_dict=task_loss_dict,
+                    total_loss=G_loss,
+                    method=gradient_method,
+                    balance_cfg=train_cfg.get('gradient_balance', {}),
+                )
                 G_optimizer.step()
-                epoch_loss += G_loss.item()
+                epoch_loss += gradient_update['effective_loss']
+                epoch_segmentation_gradient_weight += gradient_update['segmentation_weight']
+                if gradient_update['is_conflict'] is not None:
+                    epoch_gradient_conflicts += int(gradient_update['is_conflict'])
+                    epoch_gradient_updates += 1
                 epoch_task_loss += task_loss.item()
                 epoch_strategy_loss += strategy_loss.item()
                 epoch_weighted_strategy_loss += weighted_strategy_loss.item()
@@ -469,6 +504,14 @@ class RunNetworks():
                             'MSRLoss': epoch_msr_loss / (len(traindataset)),
                             'RefinementLoss': epoch_refinement_loss / (len(traindataset)),
                             'MaskLoss': epoch_mask_loss / (len(traindataset)),
+                            'GradientMethod': gradient_method,
+                            'SegmentationGradientWeight': (
+                                epoch_segmentation_gradient_weight / len(traindataset)
+                            ),
+                            'GradientConflictRate': (
+                                epoch_gradient_conflicts / epoch_gradient_updates
+                                if epoch_gradient_updates else ''
+                            ),
                             'L1': epoch_L1_loss / (len(traindataset)),
                             'MSE': epoch_mse_loss / (len(traindataset)),
                             'PSNR': epoch_psnr / (len(traindataset)),
@@ -485,6 +528,26 @@ class RunNetworks():
             # 保存模型
             if (epochs % train_cfg['model_save_every'] == 0):
                  torch.save(self.model.state_dict(), os.path.join(save_models_dir, str(epochs) + '.pth'))
+
+            foreground_miou = float(validation_metrics.get('ValidationForegroundMIoU', -1.0))
+            if foreground_miou > best_foreground_miou:
+                best_foreground_miou = foreground_miou
+                torch.save(self.model.state_dict(), os.path.join(save_models_dir, 'best.pth'))
+                with open(
+                    os.path.join(self.data_root_path, 'best_metrics.json'),
+                    'w',
+                    encoding='utf-8',
+                ) as best_file:
+                    json.dump(
+                        {
+                            'epoch': epochs,
+                            'gradient_method': gradient_method,
+                            **{key: float(value) for key, value in validation_metrics.items()},
+                        },
+                        best_file,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
 
             print()
 
@@ -1177,6 +1240,132 @@ class RunNetworks():
         if isinstance(value, torch.Tensor):
             return value.detach().item()
         return float(value)
+
+    def _apply_multitask_gradients(self, *, loss_dict, total_loss, method, balance_cfg):
+        """Backpropagate baseline or combine reconstruction/segmentation task gradients."""
+        if method == 'baseline':
+            total_loss.backward()
+            return {
+                'effective_loss': float(total_loss.detach().item()),
+                'segmentation_weight': 1.0,
+                'is_conflict': None,
+            }
+
+        reconstruction_terms = [
+            loss_dict.get('multiscale'),
+            loss_dict.get('refinement'),
+        ]
+        reconstruction_terms = [
+            value.sum() for value in reconstruction_terms if isinstance(value, torch.Tensor)
+        ]
+        segmentation_loss = loss_dict.get('mask')
+        if not reconstruction_terms or not isinstance(segmentation_loss, torch.Tensor):
+            raise RuntimeError(
+                f"Gradient method {method!r} requires multiscale/refinement and mask losses."
+            )
+
+        reconstruction_loss = sum(reconstruction_terms)
+        segmentation_loss = segmentation_loss.sum()
+        named_parameters = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        ]
+        parameters = [parameter for _, parameter in named_parameters]
+        rebuild_gradients = torch.autograd.grad(
+            reconstruction_loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        segment_gradients = torch.autograd.grad(
+            segmentation_loss,
+            parameters,
+            retain_graph=False,
+            allow_unused=True,
+        )
+
+        shared_indices = [
+            index for index, (name, _) in enumerate(named_parameters)
+            if self._gradient_parameter_group(name) is not None
+            and rebuild_gradients[index] is not None
+            and segment_gradients[index] is not None
+        ]
+        rebuild_sq = sum(
+            rebuild_gradients[index].detach().double().pow(2).sum()
+            for index in shared_indices
+        )
+        segment_sq = sum(
+            segment_gradients[index].detach().double().pow(2).sum()
+            for index in shared_indices
+        )
+        eps = float(balance_cfg.get('eps', 1e-12))
+        rebuild_norm = float(torch.sqrt(rebuild_sq).item()) if shared_indices else 0.0
+        segment_norm = float(torch.sqrt(segment_sq).item()) if shared_indices else 0.0
+
+        segmentation_weight = 1.0
+        if method in ('balance', 'balance_pcgrad'):
+            raw_weight = rebuild_norm / max(segment_norm, eps)
+            minimum = float(balance_cfg.get('min_weight', 0.1))
+            maximum = float(balance_cfg.get('max_weight', 10.0))
+            raw_weight = min(max(raw_weight, minimum), maximum)
+            beta = float(balance_cfg.get('ema_beta', 0.9))
+            if not 0.0 <= beta < 1.0:
+                raise RuntimeError('train.gradient_balance.ema_beta must be in [0, 1).')
+            if self._gradient_balance_ema is None:
+                self._gradient_balance_ema = raw_weight
+            else:
+                self._gradient_balance_ema = (
+                    beta * self._gradient_balance_ema + (1.0 - beta) * raw_weight
+                )
+            segmentation_weight = self._gradient_balance_ema
+
+        scaled_segment_gradients = [
+            None if gradient is None else gradient * segmentation_weight
+            for gradient in segment_gradients
+        ]
+        dot = sum(
+            (rebuild_gradients[index].detach().double()
+             * scaled_segment_gradients[index].detach().double()).sum()
+            for index in shared_indices
+        )
+        scaled_segment_sq = sum(
+            scaled_segment_gradients[index].detach().double().pow(2).sum()
+            for index in shared_indices
+        )
+        dot_value = float(dot.item()) if shared_indices else 0.0
+        is_conflict = dot_value < 0.0
+
+        use_pcgrad = method in ('pcgrad', 'balance_pcgrad') and is_conflict
+        rebuild_coefficient = (
+            dot_value / max(float(scaled_segment_sq.item()), eps) if use_pcgrad else 0.0
+        )
+        segment_coefficient = (
+            dot_value / max(float(rebuild_sq.item()), eps) if use_pcgrad else 0.0
+        )
+        shared_index_set = set(shared_indices)
+        for index, parameter in enumerate(parameters):
+            rebuild_gradient = rebuild_gradients[index]
+            segment_gradient = scaled_segment_gradients[index]
+            if rebuild_gradient is None:
+                combined = segment_gradient
+            elif segment_gradient is None:
+                combined = rebuild_gradient
+            elif use_pcgrad and index in shared_index_set:
+                combined = (
+                    rebuild_gradient - rebuild_coefficient * segment_gradient
+                    + segment_gradient - segment_coefficient * rebuild_gradient
+                )
+            else:
+                combined = rebuild_gradient + segment_gradient
+            parameter.grad = None if combined is None else combined.detach()
+
+        effective_loss = reconstruction_loss.detach() + segmentation_weight * segmentation_loss.detach()
+        return {
+            'effective_loss': float(effective_loss.item()),
+            'segmentation_weight': float(segmentation_weight),
+            'is_conflict': is_conflict,
+        }
 
     def _init_gradient_diagnostics(self, save_path):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)

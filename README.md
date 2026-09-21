@@ -400,3 +400,43 @@ python toRknn.py
 3. **大图处理**：启用 `data_crop.use: True`，分块尺寸设为 512（需为 128 的倍数）
 4. **多 GPU**：确认 CUDA 版本与 PyTorch 版本匹配
 5. **首次运行**：建议先用 `predict` 模式验证环境与模型加载是否正常
+
+---
+
+## 14. 四组多任务梯度实验
+
+`run_gradient_study.py` 会按相同 seed、初始化权重、数据和超参数顺序运行：
+
+1. `baseline`：原始任务损失直接求和。
+2. `balance`：用共享参数的梯度范数比动态调整分割梯度，使用 EMA 平滑并限制权重范围。
+3. `pcgrad`：检测重建与分割共享梯度的负点积，并执行双任务 PCGrad 投影。
+4. `balance_pcgrad`：先做梯度幅值平衡，再进行 PCGrad 投影。
+
+在项目根目录一键运行 RTX 5060 实验：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_gradient_study_5060.ps1
+```
+
+脚本默认使用：
+
+- 数据根目录：`D:\gaorui\SignaTR6K`，自动查找 `train` 或 `training`，验证集为 `validation`。
+- 公共初始化：`data\train\Release_20260921_095504\models\0.pth`。
+- 50 epochs、batch size 4、seed 1、每 5 轮保存 checkpoint。
+
+如路径或显存设置不同，可覆盖参数：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_gradient_study_5060.ps1 `
+  -DatasetRoot "D:\datasets\SignaTR6K" `
+  -InitialCheckpoint ".\data\train\Release_20260921_095504\models\0.pth" `
+  -Epochs 50 -BatchSize 4 -Workers 4
+```
+
+每组运行目录包含 `logs.csv`、`gradient_diagnostics.csv`、`models/best.pth` 和
+`best_metrics.json`。整套实验完成后，`data/gradient_studies/<时间>/analysis/` 会生成：
+
+- `experiment_comparison.csv`：四组最佳验证结果和最佳模型路径。
+- `gradient_summary.csv`：各共享层冲突率、平均余弦和梯度范数比。
+- `epoch_metrics.csv`：用于复现绘图的逐 epoch 数据。
+- `validation_comparison.png` 与 `gradient_training_comparison.png`：论文分析图。
