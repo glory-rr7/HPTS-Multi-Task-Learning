@@ -9,6 +9,7 @@ import torchvision.io as tvio
 from torch.utils.data import Dataset, DataLoader
 
 from dataloader.augmentation import apply_random_augmentation, apply_strategy_shared_aug, apply_strategy_extra_aug
+from dataloader.label_utils import decode_segmentation_label, resolve_dataset_directory
 
 
 def _normalize_roots(root):
@@ -49,9 +50,9 @@ class SegImageDataset(Dataset):
 
         self.samples = []
         for root_path in self.roots:
-            image_dir = os.path.join(root_path, 'images')
+            image_dir = resolve_dataset_directory(root_path, 'images', 'crop')
             rebuild_dir = os.path.join(root_path, 'rebuild')
-            label_dir = os.path.join(root_path, 'labels')
+            label_dir = resolve_dataset_directory(root_path, 'labels', 'label')
             print(image_dir, rebuild_dir, label_dir)
 
             image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
@@ -99,9 +100,7 @@ class SegImageDataset(Dataset):
             img = img[:3]
         if reb.shape[0] == 4:
             reb = reb[:3]
-        # label 只取第一通道
-        if label.shape[0] > 1:
-            label = label[0:1]
+        label = decode_segmentation_label(label, label_path)
 
         if self.use_strategy:
             # Strategy 模式：生成共享几何变换的两个视角

@@ -36,6 +36,7 @@ from dataloader.seg_datasets import SegImageDataset
 from dataloader.block_seg_datasets import BlockSegImageDataset
 from dataloader.augmentation import STRATEGY_AUG_PROB
 from config.config_utils import LoadConfig
+from segmentation_metrics import confusion_matrix, metrics_from_confusion
 
 
 
@@ -86,6 +87,15 @@ class RunNetworks():
         # 该次运行的根路径，用于存储相关文件
         self.data_root_path = os.path.join(self.config['run']['data_path'],self.worktype, self.run_id)
 
+        self.segmentation_validation_fields = [
+            'ValidationMaskLoss', 'ValidationPixelAccuracy',
+            'ValidationBackgroundIoU', 'ValidationHandwritingIoU',
+            'ValidationPrintIoU', 'ValidationOverlapIoU',
+            'ValidationMIoU', 'ValidationForegroundMIoU',
+            'ValidationBackgroundDice', 'ValidationHandwritingDice',
+            'ValidationPrintDice', 'ValidationOverlapDice',
+            'ValidationMeanDice',
+        ]
         self.train_logs_fields = [
             'epoch',
             'loss',
@@ -100,6 +110,7 @@ class RunNetworks():
             'PSNR',
             'ValidationMSE',
             'ValidationPSNR',
+            *self.segmentation_validation_fields,
             'TrainInferenceTime',
             'ValidationInferenceTime',
         ]
@@ -115,6 +126,7 @@ class RunNetworks():
             'PSNR',
             'ValidationMSE',
             'ValidationPSNR',
+            *self.segmentation_validation_fields,
             'TrainInferenceTime',
             'ValidationInferenceTime',
         ]
@@ -245,7 +257,7 @@ class RunNetworks():
             valdataloader = DataLoader(
                 valdataset,
                 batch_size=self.config['validation']['batch_size'],
-                shuffle=True,
+                shuffle=False,
                 num_workers=self.config['validation']['numberworks'],
                 pin_memory=True)
 
@@ -269,7 +281,7 @@ class RunNetworks():
             valdataloader = DataLoader(
                 valdataset,
                 batch_size=self.config['validation']['batch_size'],
-                shuffle=True,
+                shuffle=False,
                 num_workers=self.config['validation']['numberworks'],
                 pin_memory=True)
 
@@ -439,7 +451,7 @@ class RunNetworks():
 
 
             val_start = time.time()
-            val_mse, val_psnr, val_inference_time = self.test_epoch(valdataloader)
+            validation_metrics = self.test_epoch(valdataloader)
             val_cost = time.time() - val_start  # 整个验证耗时
             recent_times.append(val_cost)
             pre_time = time.time()  # 下一 epoch 计时基点
@@ -460,10 +472,8 @@ class RunNetworks():
                             'L1': epoch_L1_loss / (len(traindataset)),
                             'MSE': epoch_mse_loss / (len(traindataset)),
                             'PSNR': epoch_psnr / (len(traindataset)),
-                            'ValidationMSE': val_mse,
-                            'ValidationPSNR': val_psnr,
+                            **validation_metrics,
                             'TrainInferenceTime': epoch_inference_time,
-                            'ValidationInferenceTime': val_inference_time,
                         })
 
             # Save sample images
@@ -520,7 +530,7 @@ class RunNetworks():
             valdataloader = DataLoader(
                 valdataset,
                 batch_size=self.config['validation']['batch_size'],
-                shuffle=True,
+                shuffle=False,
                 num_workers=self.config['validation']['numberworks']
             )
         else:
@@ -544,7 +554,7 @@ class RunNetworks():
             valdataloader = DataLoader(
                 valdataset,
                 batch_size=self.config['validation']['batch_size'],
-                shuffle=True,
+                shuffle=False,
                 num_workers=self.config['validation']['numberworks'],
                 pin_memory=True
             )
@@ -675,7 +685,7 @@ class RunNetworks():
 
             self.model = self.student_model
             val_start = time.time()
-            val_mse, val_psnr, val_inference_time = self.test_epoch(valdataloader)
+            validation_metrics = self.test_epoch(valdataloader)
             val_cost = time.time() - val_start
             recent_times.append(val_cost)
             pre_time = time.time()
@@ -692,10 +702,8 @@ class RunNetworks():
                     'L1': epoch_L1_loss / len(traindataset),
                     'MSE': epoch_mse_loss / len(traindataset),
                     'PSNR': epoch_psnr / len(traindataset),
-                    'ValidationMSE': val_mse,
-                    'ValidationPSNR': val_psnr,
+                    **validation_metrics,
                     'TrainInferenceTime': epoch_inference_time,
-                    'ValidationInferenceTime': val_inference_time,
                 })
 
             if (epochs % train_cfg['sample_save_every'] == 0):
@@ -714,8 +722,7 @@ class RunNetworks():
     @torch.no_grad()
     def test_epoch(self, testloader):
         """
-        验证阶段：每个 batch 实时打印 (损失 + 计时)，格式与 train() 保持一致。
-        返回：平均 MSE、平均 PSNR
+        Validate reconstruction and semantic segmentation on the same batches.
         """
         # 切到 eval 模式
         print()
@@ -730,6 +737,9 @@ class RunNetworks():
         epoch_mse_loss = 0.0
         epoch_psnr = 0.0
         epoch_inference_time = 0.0
+        segmentation_confusion = None
+        segmentation_loss_sum = 0.0
+        segmentation_loss_weight = 0.0
 
         for idx, (imgs, gt, masks) in enumerate(testloader):
             # ---------------- 数据搬运 ----------------
@@ -742,6 +752,7 @@ class RunNetworks():
             outputs = self._forward_model(self.model, imgs)
             epoch_inference_time += self._stop_inference_timer(infer_start)
             fake_images = outputs["output"]
+            mask_logits = outputs["mask_logits"]
 
             # ---------------- 计算指标 ----------------
             L1_loss, mse_loss, psnr = SimilarityLoss(fake_images, gt, SSIM=False)
@@ -752,6 +763,31 @@ class RunNetworks():
             epoch_L1_loss += L1_loss
             epoch_mse_loss += mse_loss
             epoch_psnr += psnr
+
+            num_classes = int(mask_logits.shape[1])
+            mask_target = self._mask_target_for_model(masks, mask_logits).squeeze(1).long()
+            valid_target = (mask_target >= 0) & (mask_target < num_classes)
+            safe_target = mask_target.clone()
+            safe_target[~valid_target] = -100
+            class_weights = torch.tensor(
+                [1.0, 4.0, 5.0, 6.0][:num_classes],
+                dtype=mask_logits.dtype, device=mask_logits.device,
+            )
+            if valid_target.any():
+                segmentation_loss_sum += F.cross_entropy(
+                    mask_logits, safe_target, weight=class_weights,
+                    ignore_index=-100, reduction='sum',
+                ).item()
+                segmentation_loss_weight += class_weights[mask_target[valid_target]].sum().item()
+
+            predicted_mask = torch.argmax(mask_logits, dim=1)
+            batch_confusion = confusion_matrix(
+                predicted_mask, mask_target, num_classes,
+            ).cpu()
+            segmentation_confusion = (
+                batch_confusion if segmentation_confusion is None
+                else segmentation_confusion + batch_confusion
+            )
 
             # ---------------- 计时 ----------------
             batch_time = time.time() - pre_time
@@ -776,7 +812,42 @@ class RunNetworks():
         # 换行，避免覆盖下一条输出
         print()
 
-        return epoch_mse_loss / len(testloader), epoch_psnr / len(testloader), epoch_inference_time
+        if segmentation_confusion is None:
+            raise RuntimeError("Validation loader produced no segmentation predictions.")
+        segmentation = metrics_from_confusion(segmentation_confusion)
+        iou = segmentation['iou'].tolist()
+        dice = segmentation['dice'].tolist()
+
+        def class_metric(values, index):
+            return values[index] if index < len(values) else float('nan')
+
+        results = {
+            'ValidationMSE': epoch_mse_loss / len(testloader),
+            'ValidationPSNR': epoch_psnr / len(testloader),
+            'ValidationMaskLoss': (
+                segmentation_loss_sum / segmentation_loss_weight
+                if segmentation_loss_weight > 0 else float('nan')
+            ),
+            'ValidationPixelAccuracy': float(segmentation['pixel_accuracy']),
+            'ValidationBackgroundIoU': class_metric(iou, 0),
+            'ValidationHandwritingIoU': class_metric(iou, 1),
+            'ValidationPrintIoU': class_metric(iou, 2),
+            'ValidationOverlapIoU': class_metric(iou, 3),
+            'ValidationMIoU': float(segmentation['miou']),
+            'ValidationForegroundMIoU': float(segmentation['foreground_miou']),
+            'ValidationBackgroundDice': class_metric(dice, 0),
+            'ValidationHandwritingDice': class_metric(dice, 1),
+            'ValidationPrintDice': class_metric(dice, 2),
+            'ValidationOverlapDice': class_metric(dice, 3),
+            'ValidationMeanDice': float(segmentation['mean_dice']),
+            'ValidationInferenceTime': epoch_inference_time,
+        }
+        print(
+            f"Validation segmentation: mIoU={results['ValidationMIoU']:.4f} "
+            f"foreground mIoU={results['ValidationForegroundMIoU']:.4f} "
+            f"mean Dice={results['ValidationMeanDice']:.4f}"
+        )
+        return results
 
     def evaluate(self):
 

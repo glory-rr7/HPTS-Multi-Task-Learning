@@ -13,19 +13,19 @@ def apply_bond_color_shift(
 
     mask 为单通道标签图 (1,H,W)，类别取值:
       0: background
-      1: printed
-      2: handwriting
+      1: handwriting
+      2: printed
       3: overlap
 
     image:
-      - printed(1) 使用 printed 偏移
-      - handwriting(2) 使用 handwriting 偏移
+      - handwriting(1) 使用 handwriting 偏移
+      - printed(2) 使用 printed 偏移
       - overlap(3) 随机归入 printed 或 handwriting
 
     rebuild:
       - 仅保留 background/printed 语义
-      - printed(1) 与 overlap(3) 都使用 printed 偏移
-      - handwriting(2) 视为非打印区域，不施加手写偏移
+      - printed(2) 与 overlap(3) 都使用 printed 偏移
+      - handwriting(1) 视为非打印区域，不施加手写偏移
     """
     image = data["image"]
     rebuild = data["rebuild"]
@@ -36,8 +36,8 @@ def apply_bond_color_shift(
     label_map = mask.long().squeeze(0)
 
     assign_overlap_to_printed = random.random() > 0.5
-    printed_mask = label_map == 1
-    handwriting_mask = label_map == 2
+    handwriting_mask = label_map == 1
+    printed_mask = label_map == 2
     overlap_mask = label_map == 3
 
     if assign_overlap_to_printed:

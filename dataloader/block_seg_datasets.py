@@ -10,6 +10,7 @@ import torchvision.transforms as T
 from PIL import Image
 
 from dataloader.augmentation import apply_random_augmentation, apply_strategy_shared_aug, apply_strategy_extra_aug
+from dataloader.label_utils import decode_segmentation_label, resolve_dataset_directory
 
 
 def _normalize_roots(root):
@@ -51,9 +52,9 @@ class BlockSegImageDataset(Dataset):
 
         self.samples = []
         for root_path in self.roots:
-            image_dir = os.path.join(root_path, 'images')
+            image_dir = resolve_dataset_directory(root_path, 'images', 'crop')
             rebuild_dir = os.path.join(root_path, 'rebuild')
-            label_dir = os.path.join(root_path, 'labels')
+            label_dir = resolve_dataset_directory(root_path, 'labels', 'label')
 
             image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
             rebuild_dict = {
@@ -155,8 +156,7 @@ class BlockSegImageDataset(Dataset):
             img = img[:3]
         if reb.shape[0] == 4:
             reb = reb[:3]
-        if label.shape[0] > 1:
-            label = label[0:1]
+        label = decode_segmentation_label(label, info['label_path'])
 
         # tensor 切片裁剪 tile
         img = img[:, top:top + h, left:left + w]
