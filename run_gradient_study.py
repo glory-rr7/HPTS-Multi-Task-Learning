@@ -3,9 +3,11 @@ import copy
 import csv
 import datetime as dt
 import json
+import math
 import os
 import traceback
 import yaml
+import torch
 
 from analyze_gradient_study import analyze_runs
 from config.config_utils import LoadConfig
@@ -13,6 +15,43 @@ from runnetworks import RunNetworks
 
 
 METHODS = ('baseline', 'balance', 'pcgrad', 'balance_pcgrad')
+
+
+class _PreflightModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inc = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+        self.rebuild_head = torch.nn.Parameter(torch.tensor([1.0]))
+        self.mask_head = torch.nn.Parameter(torch.tensor([1.0]))
+
+
+def _preflight_gradient_methods():
+    """Exercise every gradient branch before starting the long experiment suite."""
+    for method in METHODS:
+        runner = RunNetworks.__new__(RunNetworks)
+        runner.model = _PreflightModel()
+        runner._gradient_balance_ema = None
+        reconstruction = (runner.model.inc * torch.tensor([1.0, 0.0])).sum()
+        reconstruction = reconstruction + runner.model.rebuild_head.sum()
+        segmentation = (runner.model.inc * torch.tensor([-1.0, 1.0])).sum()
+        segmentation = segmentation + runner.model.mask_head.sum()
+        losses = {
+            'total': reconstruction + segmentation,
+            'multiscale': reconstruction,
+            'refinement': reconstruction * 0.0,
+            'mask': segmentation,
+        }
+        result = runner._apply_multitask_gradients(
+            loss_dict=losses,
+            total_loss=losses['total'],
+            method=method,
+            balance_cfg={'min_weight': 0.1, 'max_weight': 10.0, 'ema_beta': 0.0},
+        )
+        if runner.model.inc.grad is None or not torch.isfinite(runner.model.inc.grad).all():
+            raise RuntimeError(f'Gradient preflight failed for method={method}.')
+        if not math.isfinite(result['effective_loss']):
+            raise RuntimeError(f'Non-finite preflight loss for method={method}.')
+    print('Gradient-method preflight passed:', ', '.join(METHODS))
 
 
 def _write_manifest(path, manifest):
@@ -99,6 +138,7 @@ def _experiment_config(base_config, args, method, suite_id):
 
 def main():
     args = _parse_args()
+    _preflight_gradient_methods()
     if args.initial_checkpoint and not os.path.isfile(args.initial_checkpoint):
         raise FileNotFoundError(f'Initial checkpoint not found: {args.initial_checkpoint}')
     for path in [*args.train_path, *args.validation_path]:
