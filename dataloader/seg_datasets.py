@@ -37,6 +37,21 @@ def _print_if_label_out_of_range(label, label_path, *, context):
         print(f"[DatasetLabelError] {context}: path={label_path}")
 
 
+def _ensure_three_channels(image, image_path):
+    """Convert grayscale/RGBA inputs to the 3-channel tensors expected by the model."""
+    channels = image.shape[0]
+    if channels == 1:
+        return image.repeat(3, 1, 1)
+    if channels == 4:
+        return image[:3]
+    if channels != 3:
+        raise ValueError(
+            f"Unsupported image channel count ({channels}) for path={image_path}. "
+            "Expected grayscale, RGB, or RGBA input."
+        )
+    return image
+
+
 class SegImageDataset(Dataset):
     def __init__(self, root, mode="train", use_aug=False, aug_prob=0.6, use_strategy=False):
         self.normalize = transforms.Normalize(
@@ -91,15 +106,13 @@ class SegImageDataset(Dataset):
         label_path = sample["label"]
 
         # read_image 直接返回 (C, H, W) uint8 tensor，比 PIL 快
-        img = tvio.read_image(sample["image"])      # (3, H, W)
-        reb = tvio.read_image(sample["rebuild"])     # (3, H, W)
+        img = tvio.read_image(sample["image"])
+        reb = tvio.read_image(sample["rebuild"])
         label = tvio.read_image(sample["label"])     # (1, H, W) 灰度，值 0~3
 
-        # 处理可能的 4 通道（RGBA）
-        if img.shape[0] == 4:
-            img = img[:3]
-        if reb.shape[0] == 4:
-            reb = reb[:3]
+        # 模型固定接收 RGB；兼容验证集中实际存在的灰度图和可能的 RGBA 图。
+        img = _ensure_three_channels(img, sample["image"])
+        reb = _ensure_three_channels(reb, sample["rebuild"])
         label = decode_segmentation_label(label, label_path)
 
         if self.use_strategy:
