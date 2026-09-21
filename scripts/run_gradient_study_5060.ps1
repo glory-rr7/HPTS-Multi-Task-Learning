@@ -14,6 +14,7 @@ Set-Location -LiteralPath $projectRoot
 # stale base CONDA_PREFIX. Build candidates from the active environment name,
 # then select the first interpreter that can actually import PyTorch.
 $pythonCandidates = [System.Collections.Generic.List[string]]::new()
+$pythonCandidates.Add((Join-Path $env:USERPROFILE '.conda\envs\HPTS-multi\python.exe'))
 if ($env:CONDA_DEFAULT_ENV -and $env:CONDA_DEFAULT_ENV -ne 'base') {
     $pythonCandidates.Add((Join-Path $env:USERPROFILE ".conda\envs\$($env:CONDA_DEFAULT_ENV)\python.exe"))
     if ($env:CONDA_EXE) {
